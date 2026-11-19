@@ -74,7 +74,8 @@ clar_unit_tests = executable('unit-tests',
   ),
   dependencies: [libgit_commonmain],
 )
-test('unit-tests', clar_unit_tests, kwargs: test_kwargs)
+
+test_dependencies += clar_unit_tests
 
 subdir('helper')
 
@@ -90,6 +91,7 @@ integration_tests = [
   't0008-ignores.sh',
   't0009-git-dir-validation.sh',
   't0010-racy-git.sh',
+  't0011-unit-tests.sh',
   't0012-help.sh',
   't0013-sha1dc.sh',
   't0014-alias.sh',
@@ -108,6 +110,7 @@ integration_tests = [
   't0029-core-unsetenvvars.sh',
   't0030-stripspace.sh',
   't0031-lockfile-pid.sh',
+  't0032-index-lock-timeout.sh',
   't0033-safe-directory.sh',
   't0034-root-safe-directory.sh',
   't0035-safe-bare-repository.sh',
@@ -128,6 +131,7 @@ integration_tests = [
   't0071-sort.sh',
   't0080-unit-test-output.sh',
   't0081-find-pack.sh',
+  't0082-test-chmtime.sh',
   't0090-cache-tree.sh',
   't0091-bugreport.sh',
   't0092-diagnose.sh',
@@ -737,6 +741,7 @@ integration_tests = [
   't5582-fetch-negative-refspec.sh',
   't5583-push-branches.sh',
   't5584-http-429-retry.sh',
+  't5586-fetch-refmap.sh',
   't5600-clone-fail-cleanup.sh',
   't5601-clone.sh',
   't5602-clone-remote-exec.sh',
@@ -928,6 +933,7 @@ integration_tests = [
   't7425-submodule-gitdir-path-extension.sh',
   't7426-submodule-get-default-remote.sh',
   't7427-submodule-object-storage-format.sh',
+  't7428-submodule-root-relative-url.sh',
   't7450-bad-git-dotfiles.sh',
   't7500-commit-template-squash-signoff.sh',
   't7501-commit-basic-functionality.sh',
@@ -1086,6 +1092,11 @@ integration_tests = [
   't9304-fast-import-marks.sh',
   't9305-fast-import-signatures.sh',
   't9306-fast-import-signed-tags.sh',
+  't9307-fast-import-validation.sh',
+  't9308-fast-import-stream.sh',
+  't9309-fast-import-checkpoint.sh',
+  't9310-fast-import-submodule.sh',
+  't9311-fast-import-refs.sh',
   't9350-fast-export.sh',
   't9351-fast-export-anonymize.sh',
   't9400-git-cvsserver-server.sh',

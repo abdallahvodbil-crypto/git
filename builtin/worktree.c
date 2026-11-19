@@ -26,6 +26,7 @@
 #include "submodule.h"
 #include "utf8.h"
 #include "worktree.h"
+#include "wt-status.h"
 #include "quote.h"
 
 #define BUILTIN_WORKTREE_ADD_USAGE \
@@ -802,7 +803,8 @@ static char *dwim_branch(const struct add_opts *opts, const char *path, char **n
 		int num_matches = 0;
 		struct string_list matched_remote_names = STRING_LIST_INIT_DUP;
 
-		remote = unique_tracking_name(*new_branch, &oid, &num_matches,
+		remote = unique_tracking_name(the_repository, *new_branch,
+					      &oid, &num_matches,
 					      &matched_remote_names);
 		if (!remote && num_matches > 1) {
 			if (!opts->quiet &&
@@ -938,7 +940,8 @@ static int add(int ac, const char **av, const char *prefix,
 			int num_matches = 0;
 			struct string_list matched_remote_names = STRING_LIST_INIT_DUP;
 
-			remote = unique_tracking_name(branch, &oid, &num_matches,
+			remote = unique_tracking_name(the_repository, branch,
+						      &oid, &num_matches,
 						      &matched_remote_names);
 			if (remote) {
 				new_branch = branch;
@@ -1408,6 +1411,38 @@ static void check_clean_worktree(struct worktree *wt,
 			  original_path, ret);
 }
 
+/*
+ * A rebase, "git am", bisect, cherry-pick or revert keeps its state in
+ * the worktree's own $GIT_DIR, and removing the worktree throws that
+ * away even when "git status" says the files are clean.
+ */
+static void check_no_operation_in_progress(struct worktree *wt,
+					   const char *original_path)
+{
+	struct wt_status_state state = { 0 };
+
+	if (wt_status_check_rebase(wt, &state)) {
+		if (state.am_in_progress)
+			die(_("'%s' is in the middle of an am session, use --force to delete it"),
+			    original_path);
+		die(_("'%s' is in the middle of a rebase, use --force to delete it"),
+		    original_path);
+	}
+	if (wt_status_check_bisect(wt, &state))
+		die(_("'%s' is in the middle of a bisect, use --force to delete it"),
+		    original_path);
+	wt_status_state_free_buffers(&state);
+	if (refs_ref_exists(get_worktree_ref_store(wt), "CHERRY_PICK_HEAD"))
+		die(_("'%s' is in the middle of a cherry-pick, use --force to delete it"),
+		    original_path);
+	if (refs_ref_exists(get_worktree_ref_store(wt), "REVERT_HEAD"))
+		die(_("'%s' is in the middle of a revert, use --force to delete it"),
+		    original_path);
+	if (is_directory(worktree_git_path(wt, "sequencer")))
+		die(_("'%s' is in the middle of a cherry-pick or revert, use --force to delete it"),
+		    original_path);
+}
+
 static int delete_git_work_tree(struct worktree *wt)
 {
 	struct strbuf sb = STRBUF_INIT;
@@ -1461,8 +1496,10 @@ static int remove_worktree(int ac, const char **av, const char *prefix,
 	strbuf_release(&errmsg);
 
 	if (file_exists(wt->path)) {
-		if (!force)
+		if (!force) {
+			check_no_operation_in_progress(wt, av[0]);
 			check_clean_worktree(wt, av[0]);
+		}
 
 		ret |= delete_git_work_tree(wt);
 	}

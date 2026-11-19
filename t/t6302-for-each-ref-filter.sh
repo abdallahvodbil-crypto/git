@@ -3,6 +3,7 @@
 test_description='test for-each-refs usage of ref-filter APIs'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-rebase.sh
 . "$TEST_DIRECTORY"/lib-gpg.sh
 
 test_expect_success 'setup some history and refs' '
@@ -31,7 +32,7 @@ test_expect_success 'setup some history and refs' '
 	git update-ref refs/odd/spot main
 '
 
-test_expect_success '--include-root-refs pattern prints pseudorefs' '
+test_expect_success '--include-root-refs pattern prints root refs' '
 	cat >expect <<-\EOF &&
 	HEAD
 	ORIG_HEAD
@@ -52,7 +53,7 @@ test_expect_success '--include-root-refs pattern prints pseudorefs' '
 	test_cmp expect actual
 '
 
-test_expect_success '--include-root-refs pattern does not print special refs' '
+test_expect_success '--include-root-refs pattern does not print pseudorefs' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
 	(
@@ -553,6 +554,102 @@ test_expect_success 'validate worktree atom' '
 	test_cmp expect actual
 '
 
+test_expect_success 'worktree atom names a worktree rebasing the branch' '
+	test_when_finished "git -C rebasing rebase --abort; rm -rf rebasing; git worktree prune; git branch -D rebasing" &&
+	git worktree add -b rebasing rebasing main &&
+	git -C rebasing commit --allow-empty -m rebase-me &&
+	test_must_fail git -C rebasing rebase -f -x false main &&
+	test_must_fail git -C rebasing symbolic-ref -q HEAD &&
+	echo "$(pwd)/rebasing" >expect &&
+	git for-each-ref --format="%(worktreepath)" refs/heads/rebasing >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'worktree atom names a worktree bisecting the branch' '
+	test_when_finished "git -C bisecting bisect reset; rm -rf bisecting; git worktree prune; git branch -D bisecting" &&
+	git worktree add -b bisecting bisecting main &&
+	git -C bisecting commit --allow-empty -m bisect-one &&
+	git -C bisecting commit --allow-empty -m bisect-two &&
+	git -C bisecting bisect start HEAD main &&
+	test_must_fail git -C bisecting symbolic-ref -q HEAD &&
+	echo "$(pwd)/bisecting" >expect &&
+	git for-each-ref --format="%(worktreepath)" refs/heads/bisecting >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'worktree atom with an interactive rebase stopped at edit' '
+	test_when_finished "git -C editing rebase --abort; rm -rf editing; git worktree prune; git branch -D editing" &&
+	git worktree add -b editing editing main &&
+	git -C editing commit --allow-empty -m edit-me &&
+	(
+		set_fake_editor &&
+		FAKE_LINES="edit 1" git -C editing rebase -i --keep-empty HEAD~1
+	) &&
+	test_must_fail git -C editing symbolic-ref -q HEAD &&
+	echo "$(pwd)/editing" >expect &&
+	git for-each-ref --format="%(worktreepath)" refs/heads/editing >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'worktree atom ignores branches rebase --update-refs will move' '
+	test_when_finished "git -C updating rebase --abort; rm -rf updating; git worktree prune; git branch -D updating mid" &&
+	git worktree add -b updating updating main &&
+	git -C updating commit --allow-empty -m one &&
+	git -C updating branch mid &&
+	git -C updating commit --allow-empty -m two &&
+	test_must_fail git -C updating rebase -f --update-refs -x false main &&
+	git for-each-ref --format="%(refname:short) [%(worktreepath)]" \
+		refs/heads/updating refs/heads/mid >actual &&
+	cat >expect <<-EOF &&
+	mid []
+	updating [$(pwd)/updating]
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'worktree atom ignores a rebase of a detached HEAD' '
+	test_when_finished "git -C detached-rebase rebase --abort; rm -rf detached-rebase; git worktree prune" &&
+	git worktree add --detach detached-rebase main &&
+	git -C detached-rebase commit --allow-empty -m detached &&
+	test_must_fail git -C detached-rebase rebase -f -x false main &&
+	git for-each-ref --format="%(worktreepath)" refs/heads/ >actual &&
+	test_grep ! detached-rebase actual
+'
+
+test_expect_success 'worktree atom ignores the HEAD of a bare repository' '
+	test_when_finished "rm -rf bare.git bare-wt" &&
+	git clone --bare . bare.git &&
+	git -C bare.git symbolic-ref HEAD refs/heads/main &&
+	git -C bare.git worktree add --detach ../bare-wt main &&
+	git -C bare.git for-each-ref --format="%(worktreepath)" refs/heads/main >actual &&
+	echo >expect &&
+	test_cmp expect actual &&
+	git -C bare-wt branch --list main >actual &&
+	echo "  main" >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success 'currentworktree atom' '
+	test_when_finished "git -C current rebase --abort; rm -rf current; git worktree prune; git branch -D current" &&
+	git worktree add -b current current main &&
+	git -C current commit --allow-empty -m rebase-me &&
+	test_must_fail git -C current rebase -f -x false main &&
+	git for-each-ref --format="%(refname:short) [%(currentworktree)]" \
+		refs/heads/main refs/heads/current >actual &&
+	cat >expect <<-EOF &&
+	current []
+	main [$(pwd)]
+	EOF
+	test_cmp expect actual &&
+	git -C current for-each-ref --format="%(refname:short) [%(currentworktree)]" \
+		refs/heads/main refs/heads/current >actual &&
+	cat >expect <<-EOF &&
+	current [$(pwd)/current]
+	main []
+	EOF
+	test_cmp expect actual
+'
+
 test_expect_success 'start after with empty value' '
 	cat >expect <<-\EOF &&
 	refs/heads/main
@@ -757,6 +854,61 @@ test_expect_success 'start after used with a pattern' '
 	test_must_fail git for-each-ref --format="%(refname)" --start-after=refs/odd/spot refs/tags 2>actual &&
 	test_cmp expect actual
 '
+
+for storage in loose packed mixed
+do
+	test_expect_success "start after respects directory boundaries ($storage)" '
+		test_when_finished "rm -rf repo" &&
+		git init repo &&
+		(
+			cd repo &&
+			test_commit --no-tag base &&
+			git update-ref refs/tags/packed HEAD &&
+			if test "$storage" = mixed
+			then
+				git pack-refs --all || return 1
+			fi &&
+			git update-ref --stdin <<-\EOF &&
+			create refs/tags/a-leaf HEAD
+			create refs/tags/a/nested HEAD
+			create refs/tags/a0 HEAD
+			create refs/tags/b HEAD
+			create refs/tags/releases-z HEAD
+			create refs/tags/releases/v1 HEAD
+			create refs/tags/releases/v2 HEAD
+			EOF
+			if test "$storage" = packed
+			then
+				git pack-refs --all || return 1
+			fi &&
+			echo refs/tags/releases/v2 >expect &&
+			git for-each-ref --no-sort --format="%(refname)" \
+				--start-after=refs/tags/releases/v1 >actual &&
+			test_cmp expect actual &&
+			cat >expect <<-\EOF &&
+			refs/tags/a0
+			refs/tags/b
+			refs/tags/packed
+			refs/tags/releases-z
+			refs/tags/releases/v1
+			refs/tags/releases/v2
+			EOF
+			git for-each-ref --no-sort --format="%(refname)" \
+				--start-after=refs/tags/a/next >actual &&
+			test_cmp expect actual &&
+			tail -n 5 expect >expect-later &&
+			git for-each-ref --no-sort --format="%(refname)" \
+				--start-after=refs/tags/aa/missing >actual &&
+			test_cmp expect-later actual &&
+			for marker in refs/tags/zzzz refs/zzzz zzzz
+			do
+				git for-each-ref --no-sort --format="%(refname)" \
+					--start-after="$marker" >actual &&
+				test_must_be_empty actual || return 1
+			done
+		)
+	'
+done
 
 test_expect_success 'start after used with custom sort order' '
 	cat >expect <<-\EOF &&

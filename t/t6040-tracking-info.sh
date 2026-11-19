@@ -96,7 +96,7 @@ test_expect_success 'checkout (upstream is gone)' '
 		cd test &&
 		git checkout b5
 	) >actual &&
-	test_grep "is based on .*, but the upstream is gone." actual
+	test_grep "set up to track .*, which does not exist." actual
 '
 
 test_expect_success 'checkout (up-to-date with upstream)' '
@@ -123,7 +123,153 @@ test_expect_success 'status (upstream is gone)' '
 		# reports nothing to commit
 		test_must_fail git commit --dry-run
 	) >actual &&
-	test_grep "is based on .*, but the upstream is gone." actual
+	test_grep "set up to track .*, which does not exist." actual
+'
+
+test_expect_success 'setup clone of an empty repository' '
+	git init --bare empty.git &&
+	git clone empty.git empty-clone &&
+	git -C empty-clone commit --allow-empty -m initial
+'
+
+test_expect_success 'status (upstream not yet pushed after empty clone)' '
+	cat >expect <<-EOF &&
+	On branch main
+	Your branch is set up to track ${SQ}origin/main${SQ}, which does not exist.
+	  (use "git push" to create it)
+	  (use "git branch --unset-upstream" to stop tracking it)
+
+	nothing to commit, working tree clean
+	EOF
+	git -C empty-clone status >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'checkout (upstream not yet pushed after empty clone)' '
+	test_when_finished "git -C empty-clone branch -D tmp" &&
+	cat >expect <<-EOF &&
+	Your branch is set up to track ${SQ}origin/main${SQ}, which does not exist.
+	  (use "git push" to create it)
+	  (use "git branch --unset-upstream" to stop tracking it)
+	EOF
+	git -C empty-clone checkout -b tmp &&
+	git -C empty-clone checkout main >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'status -s -b (upstream not yet pushed after empty clone)' '
+	echo "## main...origin/main [gone]" >expect &&
+	git -C empty-clone status -s -b >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'setup expected output without "git push" advice' '
+	cat >expect-no-push <<-EOF
+	On branch main
+	Your branch is set up to track ${SQ}origin/main${SQ}, which does not exist.
+	  (use "git branch --unset-upstream" to stop tracking it)
+
+	nothing to commit, working tree clean
+	EOF
+'
+
+test_expect_success 'status (missing upstream, push.default=nothing)' '
+	git -C empty-clone -c push.default=nothing status >actual &&
+	test_cmp expect-no-push actual
+'
+
+# "matching" only updates branches that already exist on the remote
+test_expect_success 'status (missing upstream, push.default=matching)' '
+	git -C empty-clone -c push.default=matching status >actual &&
+	test_cmp expect-no-push actual
+'
+
+# but push.default is not used with a push refspec or a mirror
+test_expect_success 'status (missing upstream, matching with push refspec)' '
+	git -C empty-clone -c push.default=matching \
+		-c remote.origin.push=refs/heads/main:refs/heads/main \
+		status >actual &&
+	test_grep "use \"git push\" to create it" actual
+'
+
+test_expect_success 'status (missing upstream, matching with mirror remote)' '
+	git -C empty-clone -c push.default=matching \
+		-c remote.origin.mirror=true \
+		status >actual &&
+	test_grep "use \"git push\" to create it" actual
+'
+
+test_expect_success 'status (missing upstream, mirror pushes to another name)' '
+	test_when_finished "git -C empty-clone config branch.main.merge refs/heads/main" &&
+	git -C empty-clone config branch.main.merge refs/heads/other &&
+	git -C empty-clone -c remote.origin.mirror=true status >actual &&
+	test_grep "track ${SQ}origin/other${SQ}, which does not exist" actual &&
+	test_grep ! "git push" actual
+'
+
+test_expect_success 'status (missing upstream, push refspecs without the branch)' '
+	git -C empty-clone -c remote.origin.push=refs/heads/next \
+		-c remote.origin.push=refs/heads/seen \
+		status >actual &&
+	test_cmp expect-no-push actual
+'
+
+test_expect_success 'status (missing upstream, pushRemote is another remote)' '
+	git init --bare fork.git &&
+	git -C empty-clone remote add fork ../fork.git &&
+	git -C empty-clone -c branch.main.pushRemote=fork status >actual &&
+	test_cmp expect-no-push actual
+'
+
+test_expect_success 'status (missing upstream, advice.statusHints=false)' '
+	cat >expect <<-EOF &&
+	On branch main
+	Your branch is set up to track ${SQ}origin/main${SQ}, which does not exist.
+
+	nothing to commit, working tree clean
+	EOF
+	git -C empty-clone -c advice.statusHints=false status >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'setup upstream deleted on the remote and pruned' '
+	git init --bare pruned.git &&
+	git clone pruned.git pruned-clone &&
+	(
+		cd pruned-clone &&
+		git commit --allow-empty -m initial &&
+		git push origin main &&
+		git checkout -b topic &&
+		git push -u origin topic
+	) &&
+	git -C pruned.git branch -D topic &&
+	git -C pruned-clone fetch --prune
+'
+
+test_expect_success 'status (upstream deleted on the remote and pruned)' '
+	cat >expect <<-EOF &&
+	On branch topic
+	Your branch is set up to track ${SQ}origin/topic${SQ}, which does not exist.
+	  (use "git push" to create it)
+	  (use "git branch --unset-upstream" to stop tracking it)
+
+	nothing to commit, working tree clean
+	EOF
+	git -C pruned-clone status >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'short formats still show "gone" for a deleted upstream' '
+	echo "## topic...origin/topic [gone]" >expect &&
+	git -C pruned-clone status -s -b >actual &&
+	test_cmp expect actual &&
+	git -C pruned-clone branch -vv >actual &&
+	test_grep "^\* topic .* \[origin/topic: gone\] initial$" actual &&
+	echo "topic [gone]" >expect &&
+	git -C pruned-clone for-each-ref \
+		--format="%(refname:short) %(upstream:track)" \
+		refs/heads/topic >actual &&
+	test_cmp expect actual
 '
 
 test_expect_success 'status (up-to-date with upstream)' '
@@ -331,6 +477,18 @@ test_expect_success 'status.compareBranches deduplicates when upstream and push 
 	test_cmp expect actual
 '
 
+test_expect_success 'status shows one comparison by default when upstream and push are the same' '
+	git -C test checkout main &&
+	git -C test status >actual &&
+	cat >expect <<-EOF &&
+	On branch main
+	Your branch is up to date with ${SQ}origin/main${SQ}.
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
 test_expect_success 'status.compareBranches with only upstream shows only upstream' '
 	test_config -C test status.compareBranches "@{upstream}" &&
 	git -C test checkout main &&
@@ -374,6 +532,36 @@ test_expect_success 'status.compareBranches shows ahead of both upstream and pus
 
 	Your branch is ahead of ${SQ}origin/feature3${SQ} by 1 commit.
 	  (use "git push" to publish your local commits)
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'status shows ahead of both upstream and push branch by default' '
+	test_config -C test push.default current &&
+	git -C test checkout feature3 &&
+	git -C test status >actual &&
+	cat >expect <<-EOF &&
+	On branch feature3
+	Your branch is ahead of ${SQ}origin/main${SQ} by 1 commit.
+
+	Your branch is ahead of ${SQ}origin/feature3${SQ} by 1 commit.
+	  (use "git push" to publish your local commits)
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'status.compareBranches with only upstream hides a different push branch' '
+	test_config -C test push.default current &&
+	test_config -C test status.compareBranches "@{upstream}" &&
+	git -C test checkout feature3 &&
+	git -C test status >actual &&
+	cat >expect <<-EOF &&
+	On branch feature3
+	Your branch is ahead of ${SQ}origin/main${SQ} by 1 commit.
 
 	nothing to commit, working tree clean
 	EOF
@@ -707,6 +895,21 @@ test_expect_success 'status.compareBranches with behind push branch and no upstr
 	test_cmp expect actual
 '
 
+test_expect_success 'status shows push branch by default without upstream' '
+	test_config -C test push.default current &&
+	test_config -C test remote.pushDefault origin &&
+	git -C test checkout feature15 &&
+	git -C test status >actual &&
+	cat >expect <<-EOF &&
+	On branch feature15
+	Your branch is behind ${SQ}origin/feature15${SQ} by 1 commit, and can be fast-forwarded.
+	  (use "git pull origin feature15" to update your local branch)
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
 test_expect_success 'status.compareBranches behind upstream-equals-push suggests plain pull' '
 	test_config -C test status.compareBranches "@{upstream} @{push}" &&
 	git -C test checkout -b feature16 origin/main &&
@@ -742,6 +945,169 @@ test_expect_success 'status.compareBranches suppresses advice when push tracking
 	Your branch is behind ${SQ}imported/imported/feature17${SQ} by 1 commit, and can be fast-forwarded.
 
 	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'status.compareBranches counts push divergence outside upstream' '
+	test_config -C test push.default current &&
+	test_config -C test status.compareBranches "@{upstream} @{push}" &&
+	(
+		cd test &&
+		git checkout -b feature18 origin/main &&
+		advance work18 &&
+		git push
+	) &&
+	git checkout main &&
+	advance main18a &&
+	advance main18b &&
+	git checkout - &&
+	(
+		cd test &&
+		echo amended >work18 &&
+		git commit -a --amend --no-edit &&
+		git pull --rebase &&
+		git status >../actual
+	) &&
+	cat >expect <<-EOF &&
+	On branch feature18
+	Your branch is ahead of ${SQ}origin/main${SQ} by 1 commit.
+
+	Your branch and ${SQ}origin/feature18${SQ} have diverged,
+	and have 3 and 1 different commits each (1 and 1 not in ${SQ}origin/main${SQ}).
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'status.compareBranches after a clean rebase of the push branch' '
+	test_config -C test push.default current &&
+	test_config -C test status.compareBranches "@{upstream} @{push}" &&
+	(
+		cd test &&
+		git checkout -b feature19 origin/main &&
+		advance work19 &&
+		git push
+	) &&
+	git checkout main &&
+	advance main19a &&
+	advance main19b &&
+	git checkout - &&
+	(
+		cd test &&
+		git pull --rebase &&
+		git status >../actual
+	) &&
+	cat >expect <<-EOF &&
+	On branch feature19
+	Your branch is ahead of ${SQ}origin/main${SQ} by 1 commit.
+
+	Your branch and ${SQ}origin/feature19${SQ} have diverged,
+	and have 3 and 1 different commits each (rebased cleanly on ${SQ}origin/main${SQ}).
+	  (use "git push --force-with-lease" to publish your local commits)
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual &&
+	(
+		cd test &&
+		test_must_fail git push 2>../push.err &&
+		git push --force-with-lease origin feature19 &&
+		git status >../actual
+	) &&
+	url=$(git -C test config remote.origin.url) &&
+	cat >expect <<-EOF &&
+	To $url
+	 ! [rejected]        feature19 -> feature19 (non-fast-forward)
+	error: failed to push some refs to ${SQ}$url${SQ}
+	hint: Updates were rejected because ${SQ}origin/feature19${SQ} has diverged
+	hint: from your current branch, which was rebased cleanly on ${SQ}origin/main${SQ}.
+	hint: Use ${SQ}git push --force-with-lease origin feature19${SQ} to replace it.
+	EOF
+	test_cmp expect push.err &&
+	cat >expect <<-EOF &&
+	On branch feature19
+	Your branch is ahead of ${SQ}origin/main${SQ} by 1 commit.
+
+	Your branch is up to date with ${SQ}origin/feature19${SQ}.
+
+	nothing to commit, working tree clean
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'push to a push branch someone else updated suggests pulling from it' '
+	(
+		cd test &&
+		git checkout -b feature20 origin/main &&
+		advance work20 &&
+		git push origin feature20
+	) &&
+	git checkout feature20 &&
+	advance other20 &&
+	git checkout - &&
+	(
+		cd test &&
+		advance mine20 &&
+		git fetch &&
+		test_must_fail git push origin feature20 2>../actual
+	) &&
+	url=$(git -C test config remote.origin.url) &&
+	cat >expect <<-EOF &&
+	To $url
+	 ! [rejected]        feature20 -> feature20 (non-fast-forward)
+	error: failed to push some refs to ${SQ}$url${SQ}
+	hint: Updates were rejected because ${SQ}origin/feature20${SQ} has diverged
+	hint: from your current branch. Use ${SQ}git pull origin feature20${SQ}
+	hint: to integrate the remote changes.
+	EOF
+	test_cmp expect actual
+'
+
+test_expect_success 'push to the upstream branch' '
+	(
+		cd test &&
+		git checkout -b feature21 origin/main &&
+		advance work21 &&
+		git push -u origin feature21
+	) &&
+	git checkout feature21 &&
+	advance other21 &&
+	git checkout - &&
+	(
+		cd test &&
+		advance mine21 &&
+		git fetch &&
+		test_must_fail git push 2>../actual
+	) &&
+	url=$(git -C test config remote.origin.url) &&
+	cat >expect <<-EOF &&
+	To $url
+	 ! [rejected]        feature21 -> feature21 (non-fast-forward)
+	error: failed to push some refs to ${SQ}$url${SQ}
+	hint: Updates were rejected because the tip of your current branch is behind
+	hint: its remote counterpart. If you want to integrate the remote changes,
+	hint: use ${SQ}git pull${SQ} before pushing again.
+	hint: See the ${SQ}Note about fast-forwards${SQ} in ${SQ}git push --help${SQ} for details.
+	EOF
+	test_cmp expect actual &&
+	(
+		cd test &&
+		git pull --rebase &&
+		git push &&
+		echo amended >mine21 &&
+		git commit -a --amend --no-edit &&
+		test_must_fail git push 2>../actual
+	) &&
+	cat >expect <<-EOF &&
+	To $url
+	 ! [rejected]        feature21 -> feature21 (non-fast-forward)
+	error: failed to push some refs to ${SQ}$url${SQ}
+	hint: Updates were rejected because ${SQ}origin/feature21${SQ} has diverged
+	hint: from your current branch. Use ${SQ}git pull origin feature21${SQ}
+	hint: to integrate the remote changes, or replace them with
+	hint: ${SQ}git push --force-with-lease origin feature21${SQ}.
 	EOF
 	test_cmp expect actual
 '

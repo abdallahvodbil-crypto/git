@@ -138,6 +138,7 @@ static int set_recommended_config(int reconfigure)
 	 */
 	struct scalar_config config[] = {
 		{ "am.keepCR", "true" },
+		{ "checkout.orphanedCommitWarning", "false" },
 		{ "commitGraph.changedPaths", "true" },
 		{ "commitGraph.generationVersion", "1" },
 		{ "core.autoCRLF", "false" },
@@ -652,8 +653,11 @@ static int get_scalar_repos(const char *key, const char *value,
 {
 	struct string_list *list = data;
 
-	if (!strcmp(key, "scalar.repo"))
+	if (!strcmp(key, "scalar.repo")) {
+		if (!value)
+			return config_error_nonbool(key);
 		string_list_append(list, value);
+	}
 
 	return 0;
 }

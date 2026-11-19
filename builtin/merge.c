@@ -347,7 +347,7 @@ static int save_state(struct object_id *stash)
 	int fd;
 	int rc = -1;
 
-	fd = repo_hold_locked_index(the_repository, &lock_file, 0);
+	fd = repo_try_hold_locked_index(the_repository, &lock_file, 0);
 	refresh_index(the_repository->index, REFRESH_QUIET, NULL, NULL, NULL);
 	if (0 <= fd)
 		repo_update_index_if_able(the_repository, &lock_file);
@@ -668,6 +668,8 @@ static int git_merge_config(const char *k, const char *v,
 	    skip_prefix(k, "branch.", &str) &&
 	    skip_prefix(str, branch, &str) &&
 	    !strcmp(str, ".mergeoptions")) {
+		if (!v)
+			return config_error_nonbool(k);
 		free(branch_mergeoptions);
 		branch_mergeoptions = xstrdup(v);
 		return 0;
@@ -1061,7 +1063,7 @@ static int suggest_conflicts(void)
 	fputs(msgbuf.buf, fp);
 	strbuf_release(&msgbuf);
 	fclose(fp);
-	repo_rerere(the_repository, allow_rerere_auto);
+	rerere(the_repository, allow_rerere_auto);
 	printf(_("Automatic merge failed; "
 			"fix conflicts and then commit the result.\n"));
 	return 1;

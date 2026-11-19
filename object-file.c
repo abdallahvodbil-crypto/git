@@ -155,7 +155,7 @@ int stream_object_signature(struct repository *r,
  * Map and close the given loose object fd. The path argument is used for
  * error reporting.
  */
-static void *map_fd(int fd, const char *path, unsigned long *size)
+static void *map_fd(int fd, const char *path, size_t *size)
 {
 	void *map = NULL;
 	struct stat st;
@@ -176,9 +176,9 @@ static void *map_fd(int fd, const char *path, unsigned long *size)
 
 enum unpack_loose_header_result unpack_loose_header(git_zstream *stream,
 						    unsigned char *map,
-						    unsigned long mapsize,
+						    size_t mapsize,
 						    void *buffer,
-						    unsigned long bufsiz)
+						    size_t bufsiz)
 {
 	int status;
 
@@ -209,17 +209,17 @@ enum unpack_loose_header_result unpack_loose_header(git_zstream *stream,
 }
 
 void *unpack_loose_rest(git_zstream *stream,
-			void *buffer, unsigned long size,
+			void *buffer, size_t size,
 			const struct object_id *oid)
 {
-	size_t bytes = strlen(buffer) + 1, n;
+	size_t hdrlen = strlen(buffer) + 1, bytes, n;
 	unsigned char *buf = xmallocz(size);
 	int status = Z_OK;
 
-	n = stream->total_out - bytes;
+	n = stream->total_out - hdrlen;
 	if (n > size)
 		n = size;
-	memcpy(buf, (char *) buffer + bytes, n);
+	memcpy(buf, (char *) buffer + hdrlen, n);
 	bytes = n;
 	if (bytes <= size) {
 		/*
@@ -246,6 +246,17 @@ void *unpack_loose_rest(git_zstream *stream,
 
 	if (status != Z_STREAM_END) {
 		error(_("corrupt loose object '%s'"), oid_to_hex(oid));
+		FREE_AND_NULL(buf);
+	} else if (stream->total_out != hdrlen + size) {
+		/*
+		 * A short stream would leave the tail of buf[] unwritten;
+		 * a long one can end inside the header buffer, so that
+		 * only "size" bytes were copied and the rest dropped.
+		 */
+		error(_("loose object '%s' has %"PRIuMAX" bytes, "
+			"but its header says %"PRIuMAX),
+		      oid_to_hex(oid), (uintmax_t)(stream->total_out - hdrlen),
+		      (uintmax_t)size);
 		FREE_AND_NULL(buf);
 	} else if (stream->avail_in) {
 		error(_("garbage at end of loose object '%s'"),
@@ -748,6 +759,7 @@ static int hash_stream(struct odb_stream *stream,
  */
 static void stream_to_pack(struct transaction_packfile *state,
 			   struct git_hash_ctx *ctx,
+			   struct git_hash_ctx *compat_ctx,
 			   struct odb_stream *stream)
 {
 	git_zstream s;
@@ -775,6 +787,9 @@ static void stream_to_pack(struct transaction_packfile *state,
 				is_finished = true;
 
 			git_hash_update(ctx, ibuf, rsize);
+			if (compat_ctx)
+				git_hash_update(compat_ctx,
+						ibuf, rsize);
 
 			s.next_in = ibuf;
 			s.avail_in = rsize;
@@ -883,16 +898,22 @@ static int odb_transaction_files_write_object_stream(struct odb_transaction *bas
 								 struct odb_transaction_files,
 								 base);
 	struct transaction_packfile *state = &transaction->packfile;
-	struct git_hash_ctx ctx;
+	struct git_hash_ctx ctx, compat_ctx;
+	struct object_id compat_oid;
 	unsigned char obuf[16384];
 	unsigned header_len;
 	struct hashfile_checkpoint checkpoint;
 	struct pack_idx_entry *idx;
+	const struct git_hash_algo *compat = transaction->base.source->odb->repo->compat_hash_algo;
 
 	header_len = format_object_header((char *)obuf, sizeof(obuf),
 					  stream->type, stream->size);
 	git_hash_init(&ctx, transaction->base.source->odb->repo->hash_algo);
 	git_hash_update(&ctx, obuf, header_len);
+	if (compat) {
+		git_hash_init(&compat_ctx, compat);
+		git_hash_update(&compat_ctx, obuf, header_len);
+	}
 
 	/*
 	 * If writing another object to the packfile could result in it
@@ -917,8 +938,10 @@ static int odb_transaction_files_write_object_stream(struct odb_transaction *bas
 	hashfile_checkpoint(state->f, &checkpoint);
 	idx->offset = state->offset;
 	crc32_begin(state->f);
-	stream_to_pack(state, &ctx, stream);
+	stream_to_pack(state, &ctx, compat ? &compat_ctx : NULL, stream);
 	git_hash_final_oid(result_oid, &ctx);
+	if (compat)
+		git_hash_final_oid(&compat_oid, &compat_ctx);
 
 	idx->crc32 = crc32_end(state->f);
 	if (already_written(transaction, result_oid)) {
@@ -927,6 +950,8 @@ static int odb_transaction_files_write_object_stream(struct odb_transaction *bas
 		free(idx);
 	} else {
 		oidcpy(&idx->oid, result_oid);
+		if (compat)
+			oidcpy(&idx->compat_oid, &compat_oid);
 		ALLOC_GROW(state->written,
 			   state->nr_written + 1,
 			   state->alloc_written);
@@ -1077,7 +1102,7 @@ int for_each_file_in_obj_subdir(unsigned int subdir_nr,
 		strbuf_add(path, de->d_name, namelen);
 		if (namelen == algop->hexsz - 2 &&
 		    !hex_to_bytes(oid.hash + 1, de->d_name,
-				  algop->rawsz - 1)) {
+				  algop->rawsz - 1, HEX_KIND_OID)) {
 			oid_set_algo(&oid, algop);
 			memset(oid.hash + algop->rawsz, 0,
 			       GIT_MAX_RAWSZ - algop->rawsz);
@@ -1129,7 +1154,7 @@ int for_each_loose_file_in_source(struct odb_source *source,
 
 static int check_stream_oid(git_zstream *stream,
 			    const char *hdr,
-			    unsigned long size,
+			    size_t size,
 			    const char *path,
 			    const struct object_id *expected_oid,
 			    const struct git_hash_algo *algop)
@@ -1137,7 +1162,7 @@ static int check_stream_oid(git_zstream *stream,
 	struct git_hash_ctx c;
 	struct object_id real_oid;
 	unsigned char buf[4096];
-	unsigned long total_read;
+	size_t total_read;
 	int status = Z_OK;
 
 	git_hash_init(&c, algop);
@@ -1197,7 +1222,7 @@ int read_loose_object(struct repository *repo,
 	int ret = -1;
 	int fd;
 	void *map = NULL;
-	unsigned long mapsize;
+	size_t mapsize;
 	git_zstream stream;
 	char hdr[MAX_HEADER_LEN];
 	size_t *size = oi->sizep;

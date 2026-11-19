@@ -153,6 +153,7 @@ static struct remote *make_remote(struct remote_state *remote_state,
 	ret->name = xstrndup(name, len);
 	refspec_init_push(&ret->push, the_hash_algo);
 	refspec_init_fetch(&ret->fetch, the_hash_algo);
+	refspec_init_fetch(&ret->refmap, the_hash_algo);
 	string_list_init_dup(&ret->server_options);
 	string_list_init_dup(&ret->negotiation_restrict);
 	string_list_init_dup(&ret->negotiation_include);
@@ -177,6 +178,7 @@ static void remote_clear(struct remote *remote)
 
 	refspec_clear(&remote->push);
 	refspec_clear(&remote->fetch);
+	refspec_clear(&remote->refmap);
 
 	free((char *)remote->receivepack);
 	free((char *)remote->uploadpack);
@@ -185,6 +187,7 @@ static void remote_clear(struct remote *remote)
 	string_list_clear(&remote->server_options, 0);
 	string_list_clear(&remote->negotiation_restrict, 0);
 	string_list_clear(&remote->negotiation_include, 0);
+	free(remote->follow_remote_head_raw);
 }
 
 static void add_merge(struct branch *branch, const char *name)
@@ -540,6 +543,12 @@ static int handle_config(const char *key, const char *value,
 			return -1;
 		refspec_append(&remote->fetch, v);
 		free(v);
+	} else if (!strcmp(subkey, "fetchrefmap")) {
+		char *v;
+		if (git_config_string(&v, key, value))
+			return -1;
+		refspec_append(&remote->refmap, v);
+		free(v);
 	} else if (!strcmp(subkey, "receivepack")) {
 		char *v;
 		if (git_config_string(&v, key, value))
@@ -557,6 +566,10 @@ static int handle_config(const char *key, const char *value,
 		else
 			error(_("more than one uploadpack given, using the first"));
 	} else if (!strcmp(subkey, "tagopt")) {
+		if (!value) {
+			warning(_("missing value for '%s'"), key);
+			return 0;
+		}
 		if (!strcmp(value, "--no-tags"))
 			remote->fetch_tags = -1;
 		else if (!strcmp(value, "--tags"))
@@ -582,30 +595,9 @@ static int handle_config(const char *key, const char *value,
 		return parse_transport_option(key, value,
 					      &remote->negotiation_include);
 	} else if (!strcmp(subkey, "followremotehead")) {
-		const char *no_warn_branch;
-		/*
-		 * NEEDSWORK: this is validated/warned about here, during config
-		 * parsing, regardless of whether the fetch that triggered this
-		 * parse will ever consult it for this particular remote. See
-		 * fetch.c's deferred handling of fetch.followRemoteHEAD for the
-		 * pattern this should likely follow.
-		 */
-		if (!strcmp(value, "never"))
-			remote->follow_remote_head = FOLLOW_REMOTE_NEVER;
-		else if (!strcmp(value, "create"))
-			remote->follow_remote_head = FOLLOW_REMOTE_CREATE;
-		else if (!strcmp(value, "warn")) {
-			remote->follow_remote_head = FOLLOW_REMOTE_WARN;
-			remote->no_warn_branch = NULL;
-		} else if (skip_prefix(value, "warn-if-not-", &no_warn_branch)) {
-			remote->follow_remote_head = FOLLOW_REMOTE_WARN;
-			remote->no_warn_branch = no_warn_branch;
-		} else if (!strcmp(value, "always")) {
-			remote->follow_remote_head = FOLLOW_REMOTE_ALWAYS;
-		} else {
-			warning(_("unrecognized followRemoteHEAD value '%s' ignored"),
-				value);
-		}
+		free(remote->follow_remote_head_raw);
+		remote->follow_remote_head_raw = xstrdup_or_null(value);
+		remote->follow_remote_head_seen = 1;
 	}
 	return 0;
 }
@@ -877,19 +869,23 @@ int remote_is_configured(struct remote *remote, int in_repo)
 	return !!remote->origin;
 }
 
-int for_each_remote(each_remote_fn fn, void *priv)
+int repo_for_each_remote(struct repository *repo,
+			 each_remote_fn fn, void *priv)
 {
-	int i, result = 0;
-	read_config(the_repository, 0);
-	for (i = 0; i < the_repository->remote_state->remotes_nr && !result;
-	     i++) {
-		struct remote *remote =
-			the_repository->remote_state->remotes[i];
+	int result = 0;
+	read_config(repo, 0);
+	for (int i = 0; i < repo->remote_state->remotes_nr && !result; i++) {
+		struct remote *remote = repo->remote_state->remotes[i];
 		if (!remote)
 			continue;
 		result = fn(remote, priv);
 	}
 	return result;
+}
+
+int for_each_remote(each_remote_fn fn, void *priv)
+{
+	return repo_for_each_remote(the_repository, fn, priv);
 }
 
 static void handle_duplicate(struct ref *ref1, struct ref *ref2)
@@ -996,7 +992,17 @@ void ref_push_report_free(struct ref_push_report *report)
 
 int remote_find_tracking(struct remote *remote, struct refspec_item *refspec)
 {
-	return refspec_find_match(&remote->fetch, refspec);
+	char **result = refspec->src ? &refspec->dst : &refspec->src;
+
+	if (remote->fetch.nr && !refspec_find_match(&remote->fetch, refspec))
+		return 0;
+	if (refspec_find_match(&remote->refmap, refspec))
+		return -1;
+	if (refname_matches_negative_refspec_item(refspec->src, &remote->fetch)) {
+		FREE_AND_NULL(*result);
+		return -1;
+	}
+	return 0;
 }
 
 static struct ref *alloc_ref_with_prefix(const char *prefix, size_t prefixlen,
@@ -1762,6 +1768,7 @@ void set_ref_status_for_push(struct ref *remote_refs, int send_mirror,
 	for (ref = remote_refs; ref; ref = ref->next) {
 		int force_ref_update = ref->force || force_update;
 		int reject_reason = 0;
+		int needs_force_reject_reason = 0;
 
 		if (ref->peer_ref)
 			oidcpy(&ref->new_oid, &ref->peer_ref->new_oid);
@@ -1786,14 +1793,18 @@ void set_ref_status_for_push(struct ref *remote_refs, int send_mirror,
 		 *
 		 * If the tip of the remote-tracking ref is unreachable
 		 * from any reflog entry of its local ref indicating a
-		 * possible update since checkout; reject the push.
+		 * possible update since checkout, then remember the
+		 * rejection in case force push is needed.
 		 */
 		if (ref->expect_old_sha1) {
 			if (!oideq(&ref->old_oid, &ref->old_oid_expect))
 				reject_reason = REF_STATUS_REJECT_STALE;
 			else if (ref->check_reachable && ref->unreachable)
-				reject_reason =
+				needs_force_reject_reason =
 					REF_STATUS_REJECT_REMOTE_UPDATED;
+			else if (ref->check_reachable && ref->unverifiable)
+				needs_force_reject_reason =
+					REF_STATUS_REJECT_UNVERIFIABLE;
 			else
 				/*
 				 * If the ref isn't stale, and is reachable
@@ -1835,6 +1846,14 @@ void set_ref_status_for_push(struct ref *remote_refs, int send_mirror,
 			else if (!ref_newer(&ref->new_oid, &ref->old_oid))
 				reject_reason = REF_STATUS_REJECT_NONFASTFORWARD;
 		}
+
+		/*
+		 * If fast-forward rules rejected the push and we were
+		 * asked to verify the reflog but were unable to, then
+		 * reflog verification is the right reject_reason.
+		 */
+		if (needs_force_reject_reason && reject_reason)
+			reject_reason = needs_force_reject_reason;
 
 		/*
 		 * "--force" will defeat any rejection implemented
@@ -1949,6 +1968,46 @@ int branch_merge_matches(struct branch *branch,
 	return refname_match(branch->merge[i]->src, refname);
 }
 
+void collect_upstream_from_remote(struct repository *repo,
+				   const struct remote *remote,
+				   const char *refname,
+				   struct strvec *tracked)
+{
+	struct branch *branch = repo_branch_get(repo, refname);
+
+	if (!branch_has_merge_config(branch) ||
+	    strcmp(branch->remote_name, remote->name))
+		return;
+
+	for (int i = 0; i < branch->merge_nr; i++)
+		strvec_push(tracked, branch->merge[i]->src);
+}
+
+struct branches_tracking_remote_cb_data {
+	struct repository *repo;
+	const struct remote *remote;
+	struct strvec *tracked;
+};
+
+static int add_if_tracking_remote(const struct reference *ref, void *cb_data)
+{
+	struct branches_tracking_remote_cb_data *data = cb_data;
+
+	collect_upstream_from_remote(data->repo, data->remote, ref->name,
+				      data->tracked);
+	return 0;
+}
+
+void branches_tracking_remote(struct repository *repo,
+			       const struct remote *remote,
+			       struct strvec *tracked)
+{
+	struct branches_tracking_remote_cb_data data = { repo, remote, tracked };
+
+	refs_for_each_branch_ref(get_main_ref_store(repo),
+				  add_if_tracking_remote, &data);
+}
+
 __attribute__((format (printf,2,3)))
 static char *error_buf(struct strbuf *err, const char *fmt, ...)
 {
@@ -2028,6 +2087,8 @@ static char *tracking_for_push_dest(struct repository *repo,
 
 	remote = repo_remote_for_push_tracking(repo, remote);
 	ret = apply_refspecs(&remote->fetch, refname);
+	if (!ret)
+		ret = apply_refspecs(&remote->refmap, refname);
 	if (!ret)
 		return error_buf(err,
 				 _("push destination '%s' on remote '%s' has no local tracking branch"),
@@ -2273,8 +2334,11 @@ int get_remote_group(const char *key, const char *value,
 			    void *priv)
 {
 	struct remote_group_data *g = priv;
+	const char *group;
 
-	if (skip_prefix(key, "remotes.", &key) && !strcmp(key, g->name)) {
+	if (skip_prefix(key, "remotes.", &group) && !strcmp(group, g->name)) {
+		if (!value)
+			return config_error_nonbool(key);
 		/* split list by white space */
 		while (*value) {
 			size_t wordlen = strcspn(value, " \t\n");
@@ -2331,11 +2395,12 @@ int resolve_remote_symref(struct ref *ref, struct ref *list)
  */
 
 static int stat_branch_pair(const char *branch_name, const char *base,
-			     int *num_ours, int *num_theirs,
+			     const char *exclude,
+			     int *num_ours, int *num_theirs, int *num_same,
 			     enum ahead_behind_flags abf)
 {
 	struct object_id oid;
-	struct commit *ours, *theirs;
+	struct commit *ours, *theirs, *excluded = NULL;
 	struct rev_info revs;
 	struct strvec argv = STRVEC_INIT;
 
@@ -2352,7 +2417,17 @@ static int stat_branch_pair(const char *branch_name, const char *base,
 	if (!ours)
 		return -1;
 
+	if (exclude) {
+		if (refs_read_ref(get_main_ref_store(the_repository), exclude, &oid))
+			return -1;
+		excluded = lookup_commit_reference(the_repository, &oid);
+		if (!excluded)
+			return -1;
+	}
+
 	*num_theirs = *num_ours = 0;
+	if (num_same)
+		*num_same = 0;
 
 	/* are we the same? */
 	if (theirs == ours)
@@ -2365,9 +2440,13 @@ static int stat_branch_pair(const char *branch_name, const char *base,
 	/* Run "rev-list --left-right ours...theirs" internally... */
 	strvec_push(&argv, ""); /* ignored */
 	strvec_push(&argv, "--left-right");
+	if (num_same)
+		strvec_push(&argv, "--cherry-mark");
 	strvec_pushf(&argv, "%s...%s",
 		     oid_to_hex(&ours->object.oid),
 		     oid_to_hex(&theirs->object.oid));
+	if (excluded)
+		strvec_pushf(&argv, "^%s", oid_to_hex(&excluded->object.oid));
 	strvec_push(&argv, "--");
 
 	repo_init_revisions(the_repository, &revs, NULL);
@@ -2384,11 +2463,15 @@ static int stat_branch_pair(const char *branch_name, const char *base,
 			(*num_ours)++;
 		else
 			(*num_theirs)++;
+		if (num_same && (c->object.flags & PATCHSAME))
+			(*num_same)++;
 	}
 
 	/* clear object flags smudged by the above traversal */
 	clear_commit_marks(ours, ALL_REV_FLAGS);
 	clear_commit_marks(theirs, ALL_REV_FLAGS);
+	if (excluded)
+		clear_commit_marks(excluded, ALL_REV_FLAGS);
 
 	strvec_clear(&argv);
 	release_revisions(&revs);
@@ -2428,7 +2511,49 @@ int stat_tracking_info(struct branch *branch, int *num_ours, int *num_theirs,
 	if (!base)
 		return -1;
 
-	return stat_branch_pair(branch->refname, base, num_ours, num_theirs, abf);
+	return stat_branch_pair(branch->refname, base, NULL,
+				num_ours, num_theirs, NULL, abf);
+}
+
+/*
+ * Count the commits that differ between branch_name and base but are not
+ * in upstream. Return false when they cannot be counted or upstream
+ * accounts for none of the ours and theirs commits. Otherwise set
+ * *same_changes when the remaining commits carry the same changes on
+ * both sides.
+ */
+static bool stat_outside_upstream(const char *branch_name, const char *base,
+				  const char *upstream, int ours, int theirs,
+				  int *ours_unmerged, int *theirs_unmerged,
+				  bool *same_changes)
+{
+	int same;
+
+	if (stat_branch_pair(branch_name, base, upstream, ours_unmerged,
+			     theirs_unmerged, &same, AHEAD_BEHIND_FULL) < 0)
+		return false;
+	if (*ours_unmerged == ours && *theirs_unmerged == theirs)
+		return false;
+	*same_changes = *ours_unmerged &&
+		same == *ours_unmerged + *theirs_unmerged;
+	return true;
+}
+
+bool branch_rebased_cleanly(struct branch *branch, const char *base)
+{
+	const char *upstream = branch_get_upstream(branch, NULL);
+	int ours, theirs, ours_unmerged, theirs_unmerged;
+	bool same_changes = false;
+
+	if (!upstream || !strcmp(upstream, base))
+		return false;
+	if (stat_branch_pair(branch->refname, base, NULL, &ours, &theirs,
+			     NULL, AHEAD_BEHIND_FULL) <= 0 || !ours || !theirs)
+		return false;
+	return stat_outside_upstream(branch->refname, base, upstream,
+				     ours, theirs, &ours_unmerged,
+				     &theirs_unmerged, &same_changes) &&
+	       same_changes;
 }
 
 static char *resolve_compare_branch(struct branch *branch, const char *name)
@@ -2460,6 +2585,9 @@ static void format_branch_comparison(struct strbuf *sb,
 				     const char *branch_name,
 				     const char *push_remote_name,
 				     const char *push_branch_name,
+				     const char *upstream_name,
+				     int ours_unmerged, int theirs_unmerged,
+				     bool same_changes,
 				     enum ahead_behind_flags abf,
 				     unsigned flags)
 {
@@ -2505,15 +2633,40 @@ static void format_branch_comparison(struct strbuf *sb,
 					_("  (use \"git pull\" to update your local branch)\n"));
 		}
 	} else {
-		strbuf_addf(sb,
-			Q_("Your branch and '%s' have diverged,\n"
-			       "and have %d and %d different commit each, "
-			       "respectively.\n",
-			   "Your branch and '%s' have diverged,\n"
-			       "and have %d and %d different commits each, "
-			       "respectively.\n",
-			   ours + theirs),
-			branch_name, ours, theirs);
+		if (same_changes) {
+			strbuf_addf(sb,
+				Q_("Your branch and '%s' have diverged,\n"
+				       "and have %d and %d different commit each "
+				       "(rebased cleanly on '%s').\n",
+				   "Your branch and '%s' have diverged,\n"
+				       "and have %d and %d different commits each "
+				       "(rebased cleanly on '%s').\n",
+				   ours + theirs),
+				branch_name, ours, theirs, upstream_name);
+			if (use_push_advice && advice_enabled(ADVICE_STATUS_HINTS))
+				strbuf_addstr(sb,
+					_("  (use \"git push --force-with-lease\" to publish your local commits)\n"));
+		} else if (upstream_name)
+			strbuf_addf(sb,
+				Q_("Your branch and '%s' have diverged,\n"
+				       "and have %d and %d different commit each "
+				       "(%d and %d not in '%s').\n",
+				   "Your branch and '%s' have diverged,\n"
+				       "and have %d and %d different commits each "
+				       "(%d and %d not in '%s').\n",
+				   ours + theirs),
+				branch_name, ours, theirs,
+				ours_unmerged, theirs_unmerged, upstream_name);
+		else
+			strbuf_addf(sb,
+				Q_("Your branch and '%s' have diverged,\n"
+				       "and have %d and %d different commit each, "
+				       "respectively.\n",
+				   "Your branch and '%s' have diverged,\n"
+				       "and have %d and %d different commits each, "
+				       "respectively.\n",
+				   ours + theirs),
+				branch_name, ours, theirs);
 		if (use_divergence_advice && advice_enabled(ADVICE_STATUS_HINTS)) {
 			if (push_remote_name && push_branch_name)
 				strbuf_addf(sb,
@@ -2524,6 +2677,47 @@ static void format_branch_comparison(struct strbuf *sb,
 					_("  (use \"git pull\" if you want to integrate the remote branch with yours)\n"));
 		}
 	}
+}
+
+/*
+ * Would a plain "git push" create the remote-tracking ref "upstream"?
+ *
+ * Only if "push_ref", what @{push} resolves to, is the upstream. That
+ * rules out push.default=nothing, push refspecs that do not include
+ * the branch, and pushes that go elsewhere, e.g. a mirror remote when
+ * the branch tracks a branch of a different name: @{push} does not
+ * resolve or names another ref.
+ *
+ * Even then, "matching" only updates branches that already exist on
+ * the remote, unless push refspecs or mirroring override it, as in
+ * branch_get_push_1().
+ */
+static bool push_creates(struct branch *branch, const char *push_ref,
+			 const char *upstream)
+{
+	struct remote *remote;
+
+	if (!push_ref || strcmp(push_ref, upstream))
+		return false;
+	remote = pushremote_get(pushremote_for_branch(branch, NULL));
+	if (remote && (remote->push.nr || remote->mirror))
+		return true;
+	return repo_config_values(the_repository)->push_default !=
+	       PUSH_DEFAULT_MATCHING;
+}
+
+static void format_missing_upstream(struct strbuf *sb, struct branch *branch,
+				    const char *name, const char *push_ref,
+				    const char *upstream)
+{
+	strbuf_addf(sb, _("Your branch is set up to track '%s', "
+			  "which does not exist.\n"), name);
+	if (!advice_enabled(ADVICE_STATUS_HINTS))
+		return;
+	if (push_creates(branch, push_ref, upstream))
+		strbuf_addstr(sb, _("  (use \"git push\" to create it)\n"));
+	strbuf_addstr(sb, _("  (use \"git branch --unset-upstream\" "
+			    "to stop tracking it)\n"));
 }
 
 /*
@@ -2549,6 +2743,7 @@ int format_tracking_info(struct branch *branch, struct strbuf *sb,
 		string_list_remove_empty_items(&branches, 0);
 	} else {
 		string_list_append(&branches, "@{upstream}");
+		string_list_append(&branches, "@{push}");
 	}
 
 	upstream_ref = branch_get_upstream(branch, NULL);
@@ -2557,7 +2752,10 @@ int format_tracking_info(struct branch *branch, struct strbuf *sb,
 	for (i = 0; i < branches.nr; i++) {
 		char *full_ref;
 		char *short_ref;
+		char *upstream_name = NULL;
 		int ours, theirs, cmp;
+		int ours_unmerged = 0, theirs_unmerged = 0;
+		bool same_changes = false;
 		int is_upstream, is_push;
 		unsigned flags = 0;
 		const char *push_remote_name = NULL;
@@ -2582,17 +2780,22 @@ int format_tracking_info(struct branch *branch, struct strbuf *sb,
 		if (is_upstream && (!push_ref || !strcmp(upstream_ref, push_ref)))
 			is_push = 1;
 
-		cmp = stat_branch_pair(branch->refname, full_ref,
-				       &ours, &theirs, abf);
+		cmp = stat_branch_pair(branch->refname, full_ref, NULL,
+				       &ours, &theirs, NULL, abf);
+
+		if (cmp > 0 && ours && theirs && upstream_ref && !is_upstream &&
+		    stat_outside_upstream(branch->refname, full_ref,
+					  upstream_ref, ours, theirs,
+					  &ours_unmerged, &theirs_unmerged,
+					  &same_changes))
+			upstream_name = refs_shorten_unambiguous_ref(
+				get_main_ref_store(the_repository),
+				upstream_ref, 0);
 
 		if (cmp < 0) {
 			if (is_upstream) {
-				strbuf_addf(sb,
-					_("Your branch is based on '%s', but the upstream is gone.\n"),
-					short_ref);
-				if (advice_enabled(ADVICE_STATUS_HINTS))
-					strbuf_addstr(sb,
-						_("  (use \"git branch --unset-upstream\" to fixup)\n"));
+				format_missing_upstream(sb, branch, short_ref,
+							push_ref, full_ref);
 				reported = 1;
 			}
 			free(full_ref);
@@ -2626,11 +2829,14 @@ int format_tracking_info(struct branch *branch, struct strbuf *sb,
 		}
 		format_branch_comparison(sb, !cmp, ours, theirs, short_ref,
 					 push_remote_name, push_branch_name,
+					 upstream_name, ours_unmerged,
+					 theirs_unmerged, same_changes,
 					 abf, flags);
 		reported = 1;
 
 		free(full_ref);
 		free(short_ref);
+		free(upstream_name);
 	}
 
 	string_list_clear(&branches, 0);
@@ -2985,9 +3191,31 @@ cleanup_return:
  */
 static void check_if_includes_upstream(struct ref *remote)
 {
-	struct ref *local = get_local_ref(remote->name);
-	if (!local)
+	struct ref *local;
+	const char *name;
+
+	/* ref without peer_ref will not be pushed */
+	if (!remote->peer_ref)
 		return;
+
+	/* A deletion has no local history to check against. */
+	if (is_null_oid(&remote->peer_ref->new_oid))
+		return;
+
+	name = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
+				       remote->peer_ref->name,
+				       RESOLVE_REF_READING, NULL, NULL);
+
+	/*
+	 * if we resolve the ref to anything other than a branch,
+	 * then there is no reliable reflog to check
+	 */
+	if (!name || !starts_with(name, "refs/heads/")) {
+		remote->unverifiable = 1;
+		return;
+	}
+
+	local = get_local_ref(name);
 
 	if (is_reachable_in_reflog(local->name, remote) <= 0)
 		remote->unreachable = 1;
@@ -3195,6 +3423,67 @@ char *relative_url(const char *remote_url, const char *url,
 	strbuf_reset(&sb);
 	strbuf_addf(&sb, "%s%s", up_path, out);
 	free(out);
+	return strbuf_detach(&sb, NULL);
+}
+
+static const char *skip_bracketed_host(const char *host)
+{
+	const char *start = strstr(host, "@[");
+	const char *end;
+
+	start = start ? start + 1 : host;
+	if (*start != '[')
+		return host;
+	end = strchr(start + 1, ']');
+	return end ? end : host;
+}
+
+static int has_host(const char *start, const char *end)
+{
+	const char *p;
+
+	for (p = start; p < end; p++)
+		if (*p == '@')
+			start = p + 1;
+	return start < end && *start != ':' && !starts_with(start, "[]");
+}
+
+char *root_relative_url(const char *remote_url, const char *url)
+{
+	struct strbuf sb = STRBUF_INIT;
+	const char *path, *host, *end;
+	int scp;
+
+	if (!skip_prefix(url, "^/", &path))
+		BUG("not a root-relative url: '%s'", url);
+	if (*path == '/' || *path == ':')
+		die(_("root-relative url '%s' must not start with '^//' or '^/:'"),
+		    url);
+
+	for (end = remote_url; is_urlschemechar(end == remote_url, *end); end++)
+		;
+	if (starts_with(end, "::") || starts_with(remote_url, "file://") ||
+	    url_is_local_not_ssh(remote_url))
+		return NULL;
+
+	scp = !is_url(remote_url);
+	if (scp) {
+		host = remote_url;
+		end = strchr(skip_bracketed_host(remote_url), ':');
+	} else {
+		host = strstr(remote_url, "://") + 3;
+		end = strchrnul(host, '/');
+	}
+	if (!end || !has_host(host, end))
+		return NULL;
+
+	strbuf_add(&sb, remote_url, end - remote_url);
+	strbuf_addch(&sb, scp ? ':' : '/');
+	if (scp && end[1] == '/')
+		strbuf_addch(&sb, '/');
+	strbuf_addstr(&sb, path);
+	if (ends_with(path, "/"))
+		strbuf_setlen(&sb, sb.len - 1);
 	return strbuf_detach(&sb, NULL);
 }
 

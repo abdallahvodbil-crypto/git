@@ -26,29 +26,39 @@ static int append_loose_object(const struct object_id *oid,
 	return 0;
 }
 
-static struct oidtree *odb_source_loose_cache(struct odb_source_loose *loose,
-					      const struct object_id *oid)
+static uint32_t *subdir_seen_bitmap(struct odb_source_loose *loose,
+				    const struct object_id *oid,
+				    uint32_t *mask)
 {
 	int subdir_nr = oid->hash[0];
-	struct strbuf buf = STRBUF_INIT;
 	size_t word_bits = bitsizeof(loose->subdir_seen[0]);
 	size_t word_index = subdir_nr / word_bits;
-	size_t mask = (size_t)1u << (subdir_nr % word_bits);
-	uint32_t *bitmap;
 
 	if (subdir_nr < 0 ||
 	    (size_t) subdir_nr >= bitsizeof(loose->subdir_seen))
 		BUG("subdir_nr out of range");
 
-	bitmap = &loose->subdir_seen[word_index];
+	*mask = (size_t)1u << (subdir_nr % word_bits);
+
+	return &loose->subdir_seen[word_index];
+}
+
+static struct oidtree *odb_source_loose_cache(struct odb_source_loose *loose,
+					      const struct object_id *oid)
+{
+	struct strbuf buf = STRBUF_INIT;
+	uint32_t *bitmap, mask;
+
+	bitmap = subdir_seen_bitmap(loose, oid, &mask);
 	if (*bitmap & mask)
 		return loose->cache;
+
 	if (!loose->cache) {
 		ALLOC_ARRAY(loose->cache, 1);
 		oidtree_init(loose->cache);
 	}
 	strbuf_addstr(&buf, loose->base.path);
-	for_each_file_in_obj_subdir(subdir_nr, &buf,
+	for_each_file_in_obj_subdir(oid->hash[0], &buf,
 				    loose->base.odb->repo->hash_algo,
 				    append_loose_object,
 				    NULL, NULL,
@@ -56,6 +66,19 @@ static struct oidtree *odb_source_loose_cache(struct odb_source_loose *loose,
 	*bitmap |= mask;
 	strbuf_release(&buf);
 	return loose->cache;
+}
+
+/*
+ * Mark an object as seen in the loose cache. Note that we only do this in case
+ * the particular subdirectory was scanned already. If it wasn't, then the next
+ * read would populate it anyway.
+ */
+static void loose_cache_mark_seen(struct odb_source_loose *loose,
+				  const struct object_id *oid)
+{
+	uint32_t mask, *bitmap = subdir_seen_bitmap(loose, oid, &mask);
+	if (*bitmap & mask)
+		oidtree_insert(loose->cache, oid, NULL);
 }
 
 static int quick_has_loose(struct odb_source_loose *loose,
@@ -73,7 +96,7 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 {
 	int ret;
 	int fd;
-	unsigned long mapsize;
+	size_t mapsize;
 	void *map = NULL;
 	git_zstream stream, *stream_to_end = NULL;
 	char hdr[MAX_HEADER_LEN];
@@ -250,7 +273,7 @@ static int open_loose_object(struct odb_source_loose *loose,
 
 static void *odb_source_loose_map_object(struct odb_source_loose *loose,
 					 const struct object_id *oid,
-					 unsigned long *size)
+					 size_t *size)
 {
 	const char *p;
 	int fd = open_loose_object(loose, oid, &p);
@@ -285,10 +308,11 @@ struct odb_loose_read_stream {
 		ODB_LOOSE_READ_STREAM_ERROR,
 	} z_state;
 	void *mapped;
-	unsigned long mapsize;
+	size_t mapsize;
 	char hdr[32];
 	int hdr_avail;
 	int hdr_used;
+	size_t total_read;
 };
 
 static ssize_t read_istream_loose(struct odb_stream *_st, char *buf, size_t sz)
@@ -326,6 +350,15 @@ static ssize_t read_istream_loose(struct odb_stream *_st, char *buf, size_t sz)
 
 		if (status == Z_STREAM_END) {
 			git_inflate_end(&st->z);
+			/*
+			 * The object must be exactly as large as its
+			 * header claims; like the other errors below,
+			 * this is reported by our caller.
+			 */
+			if (st->total_read + total_read != st->base.size) {
+				st->z_state = ODB_LOOSE_READ_STREAM_ERROR;
+				return -1;
+			}
 			st->z_state = ODB_LOOSE_READ_STREAM_DONE;
 			break;
 		}
@@ -335,6 +368,7 @@ static ssize_t read_istream_loose(struct odb_stream *_st, char *buf, size_t sz)
 			return -1;
 		}
 	}
+	st->total_read += total_read;
 	return total_read;
 }
 
@@ -356,7 +390,7 @@ static int odb_source_loose_read_object_stream(struct odb_stream **out,
 	struct odb_source_loose *loose = odb_source_loose_downcast(source);
 	struct object_info oi = OBJECT_INFO_INIT;
 	struct odb_loose_read_stream *st;
-	unsigned long mapsize;
+	size_t mapsize;
 	void *mapped;
 
 	mapped = odb_source_loose_map_object(loose, oid, &mapsize);
@@ -814,8 +848,13 @@ static int write_loose_object(struct odb_source_loose *loose,
 			warning_errno(_("failed utime() on %s"), tmp_file.buf);
 	}
 
-	return finalize_object_file_flags(loose->base.odb->repo, tmp_file.buf, filename.buf,
-					  FOF_SKIP_COLLISION_CHECK);
+	ret = finalize_object_file_flags(loose->base.odb->repo, tmp_file.buf, filename.buf,
+					 FOF_SKIP_COLLISION_CHECK);
+	if (ret < 0)
+		return ret;
+
+	loose_cache_mark_seen(loose, oid);
+	return 0;
 }
 
 static int odb_source_loose_write_object(struct odb_source *source,
@@ -836,7 +875,7 @@ static int odb_source_loose_write_object(struct odb_source *source,
 		return -1;
 
 	if (compat_oid)
-		return repo_add_loose_object_map(loose, oid, compat_oid);
+		return source_add_loose_object_map(loose, oid, compat_oid, OBJ_MAP_WRITE);
 
 	return 0;
 }
@@ -957,8 +996,14 @@ static int odb_source_loose_write_object_stream(struct odb_source *source,
 
 	err = finalize_object_file_flags(loose->base.odb->repo, tmp_file.buf, filename.buf,
 					 FOF_SKIP_COLLISION_CHECK);
-	if (!err && compat)
-		err = repo_add_loose_object_map(loose, oid, &compat_oid);
+	if (err < 0)
+		goto cleanup;
+
+	loose_cache_mark_seen(loose, oid);
+
+	if (compat)
+		err = source_add_loose_object_map(loose, oid, &compat_oid, OBJ_MAP_WRITE);
+
 cleanup:
 	strbuf_release(&tmp_file);
 	strbuf_release(&filename);
@@ -1003,6 +1048,31 @@ static void odb_source_loose_reparent(const char *old_cwd,
 					    loose->base.path);
 	free(loose->base.path);
 	loose->base.path = path;
+}
+
+static int odb_source_loose_map_oid(struct odb_source *source, const struct object_id *src,
+				    const struct git_hash_algo *to, struct object_id *dest,
+				    enum odb_map_oid_flags flags)
+{
+	struct odb_source_loose *loose = odb_source_loose_downcast(source);
+	/*
+	 * We may have loaded the object map at repo initialization but
+	 * another process (perhaps upstream of a pipe from us) may have
+	 * written a new object into the map.  If the object is missing,
+	 * let's reload the map to see if the object has appeared.
+	 */
+	if (flags & ODB_MAP_OID_RELOAD)
+		loose_object_map_load(loose);
+	return source_loose_object_map_oid(loose, src, to, dest);
+}
+
+static inline int odb_source_loose_write_oid_map(struct odb_source *source,
+						 const struct object_id *oid,
+						 const struct object_id *compat_oid,
+						 enum odb_write_oid_map_flags flags)
+{
+	struct odb_source_loose *loose = odb_source_loose_downcast(source);
+	return source_add_loose_object_map(loose, oid, compat_oid, flags);
 }
 
 static void odb_source_loose_free(struct odb_source *source)
@@ -1126,6 +1196,8 @@ struct odb_source_loose *odb_source_loose_new(struct object_database *odb,
 	loose->base.write_object = odb_source_loose_write_object;
 	loose->base.write_object_stream = odb_source_loose_write_object_stream;
 	loose->base.begin_transaction = odb_source_loose_begin_transaction;
+	loose->base.map_oid = odb_source_loose_map_oid;
+	loose->base.write_oid_map = odb_source_loose_write_oid_map;
 
 	if (!is_absolute_path(loose->base.path))
 		chdir_notify_register(odb_source_loose_reparent, loose);

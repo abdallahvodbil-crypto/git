@@ -62,15 +62,6 @@ struct remote_state {
 void remote_state_clear(struct remote_state *remote_state);
 struct remote_state *remote_state_new(void);
 
-#define BUILTIN_FOLLOW_REMOTE_HEAD_DFLT FOLLOW_REMOTE_CREATE
-enum follow_remote_head_settings {
-	FOLLOW_REMOTE_UNCONFIGURED = 0,
-	FOLLOW_REMOTE_NEVER,
-	FOLLOW_REMOTE_CREATE,
-	FOLLOW_REMOTE_WARN,
-	FOLLOW_REMOTE_ALWAYS,
-};
-
 struct remote {
 	struct hashmap_entry ent;
 
@@ -89,6 +80,12 @@ struct remote {
 	struct refspec push;
 
 	struct refspec fetch;
+
+	/*
+	 * How to map refs fetched without an explicit destination into our
+	 * own namespace, the same as the --refmap command line option.
+	 */
+	struct refspec refmap;
 
 	/*
 	 * The setting for whether to fetch tags (as a separate rule from the
@@ -122,8 +119,8 @@ struct remote {
 	struct string_list negotiation_restrict;
 	struct string_list negotiation_include;
 
-	enum follow_remote_head_settings follow_remote_head;
-	const char *no_warn_branch;
+	char *follow_remote_head_raw;
+	int follow_remote_head_seen;
 };
 
 /**
@@ -140,6 +137,8 @@ int remote_is_configured(struct remote *remote, int in_repo);
 typedef int each_remote_fn(struct remote *remote, void *priv);
 
 /* iterate through struct remotes */
+int repo_for_each_remote(struct repository *repo,
+			 each_remote_fn fn, void *priv);
 int for_each_remote(each_remote_fn fn, void *priv);
 
 int remote_has_url(struct remote *remote, const char *url);
@@ -171,10 +170,13 @@ struct ref {
 		/* Need to check if local reflog reaches the remote tip. */
 		check_reachable:1,
 		/*
-		 * Store the result of the check enabled by "check_reachable";
-		 * implies the local reflog does not reach the remote tip.
+		 * Store the result of the check enabled by "check_reachable".
+		 * "unreachable" implies the local reflog does not reach the remote
+		 * tip. "unverifiable" implies no local branch reflog to check; i.e.,
+		 * detached HEAD.
 		 */
-		unreachable:1;
+		unreachable:1,
+		unverifiable:1;
 
 	enum {
 		REF_NOT_MATCHED = 0, /* initial value */
@@ -205,6 +207,7 @@ struct ref {
 		REF_STATUS_REJECT_STALE,
 		REF_STATUS_REJECT_SHALLOW,
 		REF_STATUS_REJECT_REMOTE_UPDATED,
+		REF_STATUS_REJECT_UNVERIFIABLE,
 		REF_STATUS_UPTODATE,
 		REF_STATUS_REMOTE_REJECT,
 		REF_STATUS_EXPECTING_REPORT,
@@ -353,6 +356,20 @@ int branch_has_merge_config(struct branch *branch);
 
 int branch_merge_matches(struct branch *, int n, const char *);
 
+/*
+ * If refname's branch builds on remote, add its upstream on remote to
+ * tracked. A NULL refname means the current branch.
+ */
+void collect_upstream_from_remote(struct repository *repo,
+				   const struct remote *remote,
+				   const char *refname,
+				   struct strvec *tracked);
+
+/* Same as collect_upstream_from_remote(), but checked for every local branch. */
+void branches_tracking_remote(struct repository *repo,
+			       const struct remote *remote,
+			       struct strvec *tracked);
+
 /* list of the remote in a group as configured */
 struct remote_group_data {
 	const char *name;
@@ -407,6 +424,12 @@ int stat_tracking_info(struct branch *branch, int *num_ours, int *num_theirs,
 int format_tracking_info(struct branch *branch, struct strbuf *sb,
 			 enum ahead_behind_flags abf,
 			 int show_divergence_advice);
+
+/*
+ * Return true when the branch has diverged from base only because the
+ * work on base was rebased cleanly on the upstream of the branch.
+ */
+bool branch_rebased_cleanly(struct branch *branch, const char *base);
 
 struct ref *get_local_heads(void);
 
@@ -477,6 +500,21 @@ void apply_push_cas(struct push_cas_option *, struct remote *, struct ref *);
  */
 char *relative_url(const char *remote_url, const char *url,
 		   const char *up_path);
+
+/*
+ * The `url` argument starts with "^/" and names a repository relative to
+ * the root of the server that `remote_url` points to: the path of
+ * `remote_url` is replaced with the rest of `url`, keeping its scheme, user,
+ * host and port. Returns NULL if `remote_url` has no host, and dies if
+ * `url` continues with '/' or ':', which could change the kind of URL.
+ *
+ * remote_url                 url            outcome
+ * https://a.com/b/c          ^/d/e          https://a.com/d/e
+ * ssh://u@a.com:22/b/c       ^/d/e          ssh://u@a.com:22/d/e
+ * u@a.com:b/c                ^/d/e          u@a.com:d/e
+ * u@a.com:/b/c               ^/d/e          u@a.com:/d/e
+ */
+char *root_relative_url(const char *remote_url, const char *url);
 
 int valid_remote_name(const char *name);
 

@@ -823,6 +823,11 @@ static int print_one_push_report(struct ref *ref, const char *dest, int count,
 				 "remote ref updated since checkout",
 				 report, porcelain, summary_width);
 		break;
+	case REF_STATUS_REJECT_UNVERIFIABLE:
+		print_ref_status('!', "[rejected]", ref, ref->peer_ref,
+				 "remote ref unverifiable",
+				 report, porcelain, summary_width);
+		break;
 	case REF_STATUS_REJECT_SHALLOW:
 		print_ref_status('!', "[rejected]", ref, ref->peer_ref,
 				 "new shallow roots not allowed",
@@ -891,6 +896,42 @@ int transport_summary_width(const struct ref *refs)
 	return (2 * maxw + 3);
 }
 
+struct reflog_has_tip_cb_data {
+	const struct object_id *target;
+	int found;
+};
+
+static int reflog_has_tip(const char *refname UNUSED,
+			   struct object_id *old_oid UNUSED,
+			   struct object_id *new_oid,
+			   const char *committer UNUSED,
+			   timestamp_t timestamp UNUSED,
+			   int tz UNUSED, const char *msg UNUSED,
+			   void *cb_data)
+{
+	struct reflog_has_tip_cb_data *cb = cb_data;
+
+	if (!oideq(new_oid, cb->target))
+		return 0;
+	cb->found = 1;
+	return 1;
+}
+
+/*
+ * Was "refname" ever at "oid" according to its reflog? Then a remote
+ * sitting at "oid" carries no work we have not seen, only commits we
+ * have since rewritten, for example with 'commit --amend' or 'rebase'.
+ */
+static int local_ref_used_to_be_at(const char *refname,
+				    const struct object_id *oid)
+{
+	struct reflog_has_tip_cb_data cb = { .target = oid };
+
+	refs_for_each_reflog_ent_reverse(get_main_ref_store(the_repository),
+					 refname, reflog_has_tip, &cb);
+	return cb.found;
+}
+
 void transport_print_push_status(const char *dest, struct ref *refs,
 				  int verbose, int porcelain, unsigned int *reject_reasons)
 {
@@ -925,9 +966,11 @@ void transport_print_push_status(const char *dest, struct ref *refs,
 			n += print_one_push_status(ref, dest, n,
 						   porcelain, summary_width);
 		if (ref->status == REF_STATUS_REJECT_NONFASTFORWARD) {
-			if (head != NULL && !strcmp(head, ref->name))
+			if (head != NULL && !strcmp(head, ref->name)) {
 				*reject_reasons |= REJECT_NON_FF_HEAD;
-			else
+				if (local_ref_used_to_be_at(head, &ref->old_oid))
+					*reject_reasons |= REJECT_NON_FF_HEAD_REWRITE;
+			} else
 				*reject_reasons |= REJECT_NON_FF_OTHER;
 		} else if (ref->status == REF_STATUS_REJECT_ALREADY_EXISTS) {
 			*reject_reasons |= REJECT_ALREADY_EXISTS;
@@ -937,6 +980,8 @@ void transport_print_push_status(const char *dest, struct ref *refs,
 			*reject_reasons |= REJECT_NEEDS_FORCE;
 		} else if (ref->status == REF_STATUS_REJECT_REMOTE_UPDATED) {
 			*reject_reasons |= REJECT_REF_NEEDS_UPDATE;
+		} else if (ref->status == REF_STATUS_REJECT_UNVERIFIABLE) {
+			*reject_reasons |= REJECT_REF_UNVERIFIABLE;
 		}
 	}
 	free(head);
@@ -1398,6 +1443,7 @@ static int pre_push_hook_feed_stdin(int hook_stdin_fd, void *pp_cb UNUSED, void 
 	switch (r->status) {
 	case REF_STATUS_REJECT_NONFASTFORWARD:
 	case REF_STATUS_REJECT_REMOTE_UPDATED:
+	case REF_STATUS_REJECT_UNVERIFIABLE:
 	case REF_STATUS_REJECT_STALE:
 	case REF_STATUS_UPTODATE:
 		return 0; /* skip refs which won't be pushed */

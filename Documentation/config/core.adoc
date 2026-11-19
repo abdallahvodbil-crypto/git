@@ -376,7 +376,7 @@ core.logAllRefUpdates::
 	`refs/heads/`), remote refs (i.e. under `refs/remotes/`),
 	note refs (i.e. under `refs/notes/`), and the symbolic ref `HEAD`.
 	If it is set to `always`, then a missing reflog is automatically
-	created for any ref under `refs/`.
+	created for any ref, including root refs such as `ORIG_HEAD`.
 +
 This information can be used to determine what commit
 was the tip of a branch "2 days ago".
@@ -603,6 +603,12 @@ core.configLockTimeout::
 	(i.e., retry for 1 second). This is read from the configuration
 	that is already on disk before the lock is taken, so it can be
 	set persistently like any other option.
+
+core.indexLockTimeout::
+	The length of time, in milliseconds, to retry when trying to
+	lock the index file for writing. Value 0 means not to retry at
+	all; -1 means to try indefinitely. Default is 1000 (i.e., retry
+	for 1 second). Not supported by all commands.
 
 core.pager::
 	Text viewer for use by Git commands (e.g., 'less').  The value

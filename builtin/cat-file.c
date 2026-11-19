@@ -425,7 +425,7 @@ static void expand_format(struct strbuf *sb, const char *start,
 	}
 }
 
-static void batch_write(struct batch_options *opt, const void *data, int len)
+static void batch_write(struct batch_options *opt, const void *data, size_t len)
 {
 	if (opt->buffer_output) {
 		if (fwrite(data, 1, len, stdout) != len)
@@ -627,6 +627,7 @@ static void batch_one_object(const char *obj_name,
 	struct object_context ctx = {0};
 	int flags =
 		GET_OID_HASH_ANY |
+		GET_OID_GENTLY |
 		(opt->follow_symlinks ? GET_OID_FOLLOW_SYMLINKS : 0);
 	enum get_oid_result result;
 

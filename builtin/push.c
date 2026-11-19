@@ -12,6 +12,7 @@
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
+#include "refs.h"
 #include "refspec.h"
 #include "run-command.h"
 #include "remote.h"
@@ -295,6 +296,22 @@ static const char message_advice_pull_before_push[] =
 	   "use 'git pull' before pushing again.\n"
 	   "See the 'Note about fast-forwards' in 'git push --help' for details.");
 
+static const char message_advice_pull_from_branch_before_push[] =
+	N_("Updates were rejected because '%s' has diverged\n"
+	   "from your current branch. Use 'git pull %s %s'\n"
+	   "to integrate the remote changes.");
+
+static const char message_advice_force_after_clean_rebase[] =
+	N_("Updates were rejected because '%s' has diverged\n"
+	   "from your current branch, which was rebased cleanly on '%s'.\n"
+	   "Use 'git push --force-with-lease %s %s' to replace it.");
+
+static const char message_advice_pull_or_force_before_push[] =
+	N_("Updates were rejected because '%s' has diverged\n"
+	   "from your current branch. Use 'git pull %s %s'\n"
+	   "to integrate the remote changes, or replace them with\n"
+	   "'git push --force-with-lease %s %s'.");
+
 static const char message_advice_checkout_pull_push[] =
 	N_("Updates were rejected because a pushed branch tip is behind its remote\n"
 	   "counterpart. If you want to integrate the remote changes, use 'git pull'\n"
@@ -322,11 +339,56 @@ static const char message_advice_ref_needs_update[] =
 	   "remote changes, use 'git pull' before pushing again.\n"
 	   "See the 'Note about fast-forwards' in 'git push --help' for details.");
 
-static void advise_pull_before_push(void)
+static const char message_advice_ref_unverifiable[] =
+	N_("Updates were rejected because what you are pushing is not a branch,\n"
+	   "so there is no reflog to check against the tip of the remote-tracking\n"
+	   "branch. If you want to push anyway, specify the expected value with\n"
+	   "'--force-with-lease=<ref>:<expect>' or use '--no-force-if-includes'\n"
+	   "to skip this check.");
+
+static void advise_pull_before_push(struct remote *push_remote,
+				    unsigned int reject_reasons)
 {
+	struct branch *branch = branch_get(NULL);
+	struct remote *remote = NULL;
+	const char *upstream = NULL;
+	char *tracking = NULL;
+	char *tracking_name = NULL;
+
 	if (!advice_enabled(ADVICE_PUSH_NON_FF_CURRENT) || !advice_enabled(ADVICE_PUSH_UPDATE_REJECTED))
 		return;
-	advise(_(message_advice_pull_before_push));
+
+	if (branch) {
+		remote = repo_remote_for_push_tracking(the_repository,
+						       push_remote);
+		tracking = apply_refspecs(&remote->fetch, branch->refname);
+		upstream = branch_get_upstream(branch, NULL);
+	}
+	if (tracking)
+		tracking_name = refs_shorten_unambiguous_ref(
+			get_main_ref_store(the_repository), tracking, 0);
+
+	if (tracking && branch_rebased_cleanly(branch, tracking)) {
+		char *upstream_name = refs_shorten_unambiguous_ref(
+			get_main_ref_store(the_repository), upstream, 0);
+
+		advise(_(message_advice_force_after_clean_rebase),
+		       tracking_name, upstream_name,
+		       remote->name, branch->name);
+		free(upstream_name);
+	} else if (tracking && (reject_reasons & REJECT_NON_FF_HEAD_REWRITE)) {
+		advise(_(message_advice_pull_or_force_before_push),
+		       tracking_name, remote->name, branch->name,
+		       remote->name, branch->name);
+	} else if (tracking && (!upstream || strcmp(tracking, upstream))) {
+		advise(_(message_advice_pull_from_branch_before_push),
+		       tracking_name, remote->name, branch->name);
+	} else {
+		advise(_(message_advice_pull_before_push));
+	}
+
+	free(tracking_name);
+	free(tracking);
 }
 
 static void advise_checkout_pull_push(void)
@@ -364,12 +426,21 @@ static void advise_ref_needs_update(void)
 	advise(_(message_advice_ref_needs_update));
 }
 
+static void advise_ref_unverifiable(void)
+{
+	if (!advice_enabled(ADVICE_PUSH_REF_UNVERIFIABLE) ||
+			!advice_enabled(ADVICE_PUSH_UPDATE_REJECTED))
+		return;
+	advise(_(message_advice_ref_unverifiable));
+}
+
 static int push_with_options(struct transport *transport, struct refspec *rs,
 			     int flags)
 {
 	int err;
 	unsigned int reject_reasons;
 	char *anon_url = transport_anonymize_url(transport->url);
+	struct remote *remote = transport->remote;
 
 	transport_set_verbosity(transport, verbosity, progress);
 	transport->family = family;
@@ -404,7 +475,7 @@ static int push_with_options(struct transport *transport, struct refspec *rs,
 		return 0;
 
 	if (reject_reasons & REJECT_NON_FF_HEAD) {
-		advise_pull_before_push();
+		advise_pull_before_push(remote, reject_reasons);
 	} else if (reject_reasons & REJECT_NON_FF_OTHER) {
 		advise_checkout_pull_push();
 	} else if (reject_reasons & REJECT_ALREADY_EXISTS) {
@@ -415,6 +486,8 @@ static int push_with_options(struct transport *transport, struct refspec *rs,
 		advise_ref_needs_force();
 	} else if (reject_reasons & REJECT_REF_NEEDS_UPDATE) {
 		advise_ref_needs_update();
+	} else if (reject_reasons & REJECT_REF_UNVERIFIABLE) {
+		advise_ref_unverifiable();
 	}
 
 	return 1;
@@ -627,6 +700,9 @@ static int push_multiple(struct string_list *list,
 		strvec_pushf(&argv, "--push-option=%s",
 			     push_options->items[i].string);
 
+	if (cas.use_tracking_for_rest)
+		strvec_push(&argv, "--force-with-lease");
+
 	for (i = 0; i < cas.nr; i++) {
 		if (cas.entry[i].use_tracking) {
 			strvec_pushf(&argv, "--force-with-lease=%s",
@@ -636,7 +712,9 @@ static int push_multiple(struct string_list *list,
 				     cas.entry[i].refname,
 				     oid_to_hex(&cas.entry[i].expect));
 		} else {
-			strvec_push(&argv, "--force-with-lease");
+			/* <ref>: means expect ref not to exist */
+			strvec_pushf(&argv, "--force-with-lease=%s:",
+				     cas.entry[i].refname);
 		}
 	}
 

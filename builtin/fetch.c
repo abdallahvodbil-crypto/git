@@ -65,6 +65,15 @@ enum display_format {
 	DISPLAY_FORMAT_PORCELAIN,
 };
 
+#define BUILTIN_FOLLOW_REMOTE_HEAD_DFLT FOLLOW_REMOTE_CREATE
+enum follow_remote_head_settings {
+	FOLLOW_REMOTE_UNCONFIGURED = 0,
+	FOLLOW_REMOTE_NEVER,
+	FOLLOW_REMOTE_CREATE,
+	FOLLOW_REMOTE_WARN,
+	FOLLOW_REMOTE_ALWAYS,
+};
+
 struct display_state {
 	struct strbuf buf;
 
@@ -187,19 +196,22 @@ static int git_fetch_config(const char *k, const char *v,
 	return git_default_config(k, v, ctx, cb);
 }
 
-static enum follow_remote_head_settings get_follow_remote_head(const char *setting)
+static enum follow_remote_head_settings get_follow_remote_head(const char *setting,
+    const char *key, const char **no_warn_branch)
 {
 	if (!setting)
-		die(_("missing value for 'fetch.followRemoteHEAD'"));
+		die(_("missing value for '%s'"), key);
 	else if (!strcmp(setting, "never"))
 		return FOLLOW_REMOTE_NEVER;
 	else if (!strcmp(setting, "create"))
 		return FOLLOW_REMOTE_CREATE;
 	else if (!strcmp(setting, "warn"))
 		return FOLLOW_REMOTE_WARN;
+	else if (no_warn_branch && skip_prefix(setting, "warn-if-not-", no_warn_branch))
+		return FOLLOW_REMOTE_WARN;
 	else if (!strcmp(setting, "always"))
 		return FOLLOW_REMOTE_ALWAYS;
-	warning(_("unrecognized fetch.followRemoteHEAD value '%s' ignored"), setting);
+	warning(_("unrecognized %s value '%s' ignored"), key, setting);
 	return BUILTIN_FOLLOW_REMOTE_HEAD_DFLT;
 }
 
@@ -518,6 +530,14 @@ static struct ref *get_ref_map(struct remote *remote,
 	struct ref *rm;
 	struct ref *ref_map = NULL;
 	struct ref **tail = &ref_map;
+	/*
+	 * The --refmap command line option, if given, takes precedence
+	 * over remote.<name>.fetchRefmap.
+	 */
+	struct refspec *effective_refmap =
+		refmap.nr ? &refmap : remote ? &remote->refmap : NULL;
+	struct refspec inferred_rs;
+	int infer_from_refmap = 0;
 
 	/* opportunistically-updated references: */
 	struct ref *orefs = NULL, **oref_tail = &orefs;
@@ -525,15 +545,33 @@ static struct ref *get_ref_map(struct remote *remote,
 	struct hashmap existing_refs;
 	int existing_refs_populated = 0;
 
+	refspec_init_fetch(&inferred_rs, the_hash_algo);
+
 	filter_prefetch_refspec(rs);
 	if (remote)
 		filter_prefetch_refspec(&remote->fetch);
+	if (effective_refmap)
+		filter_prefetch_refspec(effective_refmap);
+
+	if (!rs->nr && remote && !remote->fetch.nr &&
+	    effective_refmap && effective_refmap->nr) {
+		struct strvec tracked = STRVEC_INIT;
+
+		branches_tracking_remote(the_repository, remote, &tracked);
+		for (size_t i = 0; i < tracked.nr; i++)
+			refspec_append(&inferred_rs, tracked.v[i]);
+		strvec_clear(&tracked);
+
+		rs = &inferred_rs;
+		infer_from_refmap = 1;
+	}
 
 	if (rs->nr) {
 		struct refspec *fetch_refspec;
 
 		for (i = 0; i < rs->nr; i++) {
-			get_fetch_map(remote_refs, &rs->items[i], &tail, 0);
+			get_fetch_map(remote_refs, &rs->items[i], &tail,
+				      infer_from_refmap);
 			if (rs->items[i].dst && rs->items[i].dst[0])
 				*autotags = 1;
 		}
@@ -561,13 +599,15 @@ static struct ref *get_ref_map(struct remote *remote,
 		 * by ref_remove_duplicates() in favor of one of these
 		 * opportunistic entries with FETCH_HEAD_IGNORE.
 		 */
-		if (refmap.nr)
-			fetch_refspec = &refmap;
+		if (effective_refmap && effective_refmap->nr)
+			fetch_refspec = effective_refmap;
 		else
 			fetch_refspec = &remote->fetch;
 
 		for (i = 0; i < fetch_refspec->nr; i++)
 			get_fetch_map(ref_map, &fetch_refspec->items[i], &oref_tail, 1);
+	} else if (infer_from_refmap) {
+		/* Already fully handled above. */
 	} else if (refmap.nr) {
 		die("--refmap option is only meaningful with command-line refspec(s)");
 	} else {
@@ -597,6 +637,10 @@ static struct ref *get_ref_map(struct remote *remote,
 			if (has_merge &&
 			    !strcmp(branch->remote_name, remote->name))
 				add_merge_config(&ref_map, remote_refs, branch, &tail);
+
+			for (i = 0; i < remote->refmap.nr; i++)
+				get_fetch_map(ref_map, &remote->refmap.items[i],
+					      &oref_tail, 1);
 		} else if (!prefetch) {
 			ref_map = get_remote_ref(remote_refs, "HEAD");
 			if (!ref_map)
@@ -663,6 +707,7 @@ static struct ref *get_ref_map(struct remote *remote,
 	if (existing_refs_populated)
 		hashmap_clear_and_free(&existing_refs, struct refname_hash_entry, ent);
 
+	refspec_clear(&inferred_rs);
 	return ref_map;
 }
 
@@ -1777,12 +1822,11 @@ static void warn_set_head(const char *remote, const char *head_name,
 }
 
 static int set_head(const struct ref *remote_refs, struct remote *remote,
-			int follow_remote_head)
+		    int follow_remote_head, const char *no_warn_branch)
 {
 	int result = 0, create_only, baremirror, was_detached;
 	struct strbuf b_head = STRBUF_INIT, b_remote_head = STRBUF_INIT,
 		      b_local_head = STRBUF_INIT;
-	const char *no_warn_branch = remote->no_warn_branch;
 	char *head_name = NULL;
 	struct ref *ref, *matches;
 	struct ref *fetch_map = NULL, **fetch_map_tail = &fetch_map;
@@ -1952,6 +1996,28 @@ static void collect_updated_tips(struct oidset *tips, struct ref *ref_map)
 	}
 }
 
+static int lazy_follow_remote_head(const struct transport *transport,
+				   const struct fetch_config *config,
+				   const char **no_warn_branch)
+{
+	int ret = BUILTIN_FOLLOW_REMOTE_HEAD_DFLT;
+
+	if (transport->remote->follow_remote_head_seen) {
+		char *key = xstrfmt("remote.%s.followRemoteHEAD",
+				    transport->remote->name);
+		ret = get_follow_remote_head(
+			transport->remote->follow_remote_head_raw,
+			key, no_warn_branch);
+		free(key);
+	} else if (config->follow_remote_head_seen) {
+		ret = get_follow_remote_head(
+			config->follow_remote_head_raw,
+			"fetch.followRemoteHEAD", NULL);
+	}
+
+	return ret;
+}
+
 static int do_fetch(struct transport *transport,
 		    struct refspec *rs,
 		    const struct fetch_config *config,
@@ -1972,6 +2038,8 @@ static int do_fetch(struct transport *transport,
 	struct strmap rejected_refs = STRMAP_INIT;
 	int summary_width = 0;
 	int follow_remote_head = FOLLOW_REMOTE_NEVER;
+	bool apply_follow_remote_head_config = false;
+	const char *no_warn_branch = NULL;
 
 	if (tags == TAGS_DEFAULT) {
 		if (transport->remote->fetch_tags == 2)
@@ -1989,30 +2057,33 @@ static int do_fetch(struct transport *transport,
 
 	if (rs->nr) {
 		refspec_ref_prefixes(rs, &transport_ls_refs_options.ref_prefixes);
-	} else {
-		struct branch *branch = branch_get(NULL);
+	} else if (transport->remote->fetch.nr) {
+		refspec_ref_prefixes(&transport->remote->fetch,
+				     &transport_ls_refs_options.ref_prefixes);
+		apply_follow_remote_head_config = true;
 
-		if (transport->remote->fetch.nr) {
-			refspec_ref_prefixes(&transport->remote->fetch,
-					     &transport_ls_refs_options.ref_prefixes);
-			/*
-			 * See remote.c's handling of remote.<name>.followRemoteHEAD
-			 * for the analogous, still-unresolved case.
-			 */
-			if (transport->remote->follow_remote_head)
-				follow_remote_head = transport->remote->follow_remote_head;
-			else if (config->follow_remote_head_seen)
-				follow_remote_head = get_follow_remote_head(config->follow_remote_head_raw);
-			else
-				follow_remote_head = BUILTIN_FOLLOW_REMOTE_HEAD_DFLT;
-		}
-		if (branch && branch_has_merge_config(branch) &&
-		    !strcmp(branch->remote_name, transport->remote->name)) {
-			int i;
-			for (i = 0; i < branch->merge_nr; i++) {
-				strvec_push(&transport_ls_refs_options.ref_prefixes,
-					    branch->merge[i]->src);
-			}
+		/*
+		 * The configured refspec may not cover the current
+		 * branch's upstream (e.g. a narrowed -t refspec), so
+		 * make sure we can still fetch it regardless.
+		 */
+		collect_upstream_from_remote(the_repository, transport->remote,
+					      NULL, &transport_ls_refs_options.ref_prefixes);
+	} else {
+		/*
+		 * The --refmap command line option, if given, takes
+		 * precedence over remote.<name>.fetchRefmap.
+		 */
+		struct refspec *effective_refmap = refmap.nr ? &refmap :
+			&transport->remote->refmap;
+
+		if (effective_refmap->nr) {
+			branches_tracking_remote(the_repository, transport->remote,
+						  &transport_ls_refs_options.ref_prefixes);
+			apply_follow_remote_head_config = true;
+		} else {
+			collect_upstream_from_remote(the_repository, transport->remote,
+						      NULL, &transport_ls_refs_options.ref_prefixes);
 		}
 
 		/*
@@ -2022,6 +2093,12 @@ static int do_fetch(struct transport *transport,
 		if (!transport_ls_refs_options.ref_prefixes.nr)
 			strvec_push(&transport_ls_refs_options.ref_prefixes,
 				    "HEAD");
+	}
+
+	if (apply_follow_remote_head_config) {
+		follow_remote_head =
+			lazy_follow_remote_head(transport, config,
+						&no_warn_branch);
 	}
 
 	if (tags == TAGS_SET || tags == TAGS_DEFAULT)
@@ -2225,7 +2302,7 @@ static int do_fetch(struct transport *transport,
 		 * Way too many cases where this can go wrong so let's just
 		 * ignore errors and fail silently for now.
 		 */
-		set_head(remote_refs, transport->remote, follow_remote_head);
+		set_head(remote_refs, transport->remote, follow_remote_head, no_warn_branch);
 	}
 
 cleanup:
@@ -2978,9 +3055,7 @@ int cmd_fetch(int argc,
 		if (graph_write_mode != GRAPH_WRITE_SKIP) {
 			trace2_region_enter("fetch", "write-commit-graph",
 					    the_repository);
-			commit_graph_write(the_repository,
-					   the_repository->objects->source->path,
-					   &write_opts);
+			odb_write_commit_graph(the_repository->objects, &write_opts);
 			trace2_region_leave("fetch", "write-commit-graph",
 					    the_repository);
 		}

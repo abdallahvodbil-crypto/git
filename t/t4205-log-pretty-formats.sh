@@ -1139,7 +1139,7 @@ test_expect_success 'log --pretty with invalid padding format' '
 test_expect_success 'log --pretty with magical wrapping directives' '
 	commit_id=$(git commit-tree HEAD^{tree} -m "describe me") &&
 	git tag describe-me $commit_id &&
-	printf "\n(tag:\ndescribe-me)%%+w(2)" >expect &&
+	printf "\n\n(tag:\ndescribe-me)%%+w(2)" >expect &&
 	git log -1 --pretty="format:%w(1)%+d%+w(2)" $commit_id >actual &&
 	test_cmp expect actual
 '
@@ -1182,7 +1182,7 @@ test_expect_success EXPENSIVE,SIZE_T_IS_64BIT 'log --pretty with huge commit mes
 '
 
 test_expect_success EXPENSIVE,SIZE_T_IS_64BIT 'set up huge commit' '
-	test-tool genzeros 2147483649 | tr "\000" "1" >expect &&
+	test-tool genbytes 1 2147483649 >expect &&
 	huge_commit=$(git commit-tree -F expect HEAD^{tree})
 '
 

@@ -2,6 +2,7 @@
 #define ODB_H
 
 #include "hashmap.h"
+#include "loose.h"
 #include "object.h"
 #include "oid-array.h"
 #include "oidset.h"
@@ -220,6 +221,16 @@ struct odb_fsck_options {
  * negative error code otherwise.
  */
 int odb_fsck(struct object_database *odb, struct odb_fsck_options *opts);
+
+struct commit_graph_write_options;
+
+/*
+ * Write a new commit graph layer into the primary object source. The source
+ * is in control of where and how the layer is stored. Returns 0 on success, a
+ * negative error code otherwise.
+ */
+int odb_write_commit_graph(struct object_database *odb,
+			   const struct commit_graph_write_options *opts);
 
 /*
  * Iterate through all alternates of the database and execute the provided
@@ -649,6 +660,29 @@ static inline int odb_write_object(struct object_database *odb,
 }
 
 struct odb_stream;
+
+enum odb_map_oid_flags {
+	/* Reload this source to obtain any new information. */
+	ODB_MAP_OID_RELOAD = (1 << 0),
+};
+
+int odb_map_oid(struct object_database *odb,
+		const struct object_id *src,
+		const struct git_hash_algo *to,
+		struct object_id *dest,
+		enum odb_map_oid_flags flags);
+
+enum odb_write_oid_map_flags {
+	/*
+	 * Serialize this data to disk instead of persisting it only in memory.
+	 */
+	ODB_WRITE_OID_MAP_WRITE = OBJ_MAP_WRITE,
+};
+
+int odb_write_oid_map(struct object_database *odb,
+		      const struct object_id *oid,
+		      const struct object_id *compat_oid,
+		      enum odb_write_oid_map_flags flags);
 
 int odb_write_object_stream(struct object_database *odb,
 			    struct odb_stream *stream,

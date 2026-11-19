@@ -451,6 +451,41 @@ test_expect_success 'empty --batch-check notices missing object' '
 	test_cmp expect actual
 '
 
+test_expect_success '--batch-check reports reflog entries out of range as missing' '
+	test_when_finished "rm -rf reflog-range" &&
+	git init reflog-range &&
+	(
+		cd reflog-range &&
+		test_commit one &&
+		test_commit two &&
+		test_commit three &&
+		# keep a non-null "old" side in the oldest entry
+		git reflog delete HEAD@{2} &&
+		git branch empty &&
+		git reflog expire --expire=all refs/heads/empty &&
+		cat >in <<-\EOF &&
+		HEAD@{2}
+		HEAD@{1970-01-02}
+		HEAD@{3}
+		HEAD@{999999}^{tree}
+		HEAD@{999999}:one.t
+		empty@{1}
+		HEAD
+		EOF
+		cat >expect <<-EOF &&
+		$(git rev-parse one)
+		$(git rev-parse one)
+		HEAD@{3} missing
+		HEAD@{999999}^{tree} missing
+		HEAD@{999999}:one.t missing
+		empty@{1} missing
+		$(git rev-parse three)
+		EOF
+		git cat-file --batch-check="%(objectname)" <in >actual &&
+		test_cmp expect actual
+	)
+'
+
 batch_tests () {
     boid=$1
     loid=$2
@@ -1511,6 +1546,24 @@ test_expect_success PIPE 'concurrently written alternates are loaded' '
 		echo "$oid blob 0" >expect &&
 		test_cmp expect actual
 	)
+'
+
+test_expect_success 'setup blobs with bogus size in header' '
+	git init bogus-size &&
+	echo_without_newline short |
+	loose_obj bogus-size/.git/objects blob 100 >oid-too-big &&
+	echo_without_newline "much longer" |
+	loose_obj bogus-size/.git/objects blob 3 >oid-too-small
+'
+
+test_expect_success 'streaming blob shorter than its header fails' '
+	test_must_fail git -C bogus-size cat-file blob $(cat oid-too-big) >out 2>err &&
+	test_grep "unable to stream" err
+'
+
+test_expect_success 'streaming blob longer than its header fails' '
+	test_must_fail git -C bogus-size cat-file blob $(cat oid-too-small) >out 2>err &&
+	test_grep "unable to stream" err
 '
 
 test_done

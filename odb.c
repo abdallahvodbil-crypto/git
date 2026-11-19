@@ -162,7 +162,7 @@ static void fill_alternate_refs_command(struct repository *repo,
 {
 	const char *value;
 
-	if (!repo_config_get_value(repo, "core.alternateRefsCommand", &value)) {
+	if (!repo_config_get_string_tmp(repo, "core.alternateRefsCommand", &value)) {
 		cmd->use_shell = 1;
 
 		strvec_push(&cmd->args, value);
@@ -174,7 +174,7 @@ static void fill_alternate_refs_command(struct repository *repo,
 		strvec_push(&cmd->args, "for-each-ref");
 		strvec_push(&cmd->args, "--format=%(objectname)");
 
-		if (!repo_config_get_value(repo, "core.alternateRefsPrefixes", &value)) {
+		if (!repo_config_get_string_tmp(repo, "core.alternateRefsPrefixes", &value)) {
 			strvec_push(&cmd->args, "--");
 			strvec_split(&cmd->args, value);
 		}
@@ -625,6 +625,23 @@ out:
 	return ret;
 }
 
+int odb_map_oid(struct object_database *odb,
+		const struct object_id *src,
+		const struct git_hash_algo *to,
+		struct object_id *dest,
+		enum odb_map_oid_flags flags)
+{
+	return odb_source_map_oid(odb->source, src, to, dest, flags);
+}
+
+int odb_write_oid_map(struct object_database *odb,
+		      const struct object_id *oid,
+		      const struct object_id *compat_oid,
+		      enum odb_write_oid_map_flags flags)
+{
+	return odb_source_write_oid_map(odb->source, oid, compat_oid, flags);
+}
+
 /*
  * Return the slot of the most-significant bit set in "val". There are various
  * ways to do this quickly with fls() or __builtin_clzl(), but speed is
@@ -846,4 +863,10 @@ void odb_reprepare(struct object_database *o)
 int odb_fsck(struct object_database *odb, struct odb_fsck_options *options)
 {
 	return odb_source_fsck(odb->source, options);
+}
+
+int odb_write_commit_graph(struct object_database *odb,
+			   const struct commit_graph_write_options *opts)
+{
+	return odb_source_write_commit_graph(odb->source, opts);
 }
